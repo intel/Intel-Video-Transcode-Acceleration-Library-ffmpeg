@@ -1,0 +1,221 @@
+From b2f29ffa6a83d22ab28d1dc496864bfddbab0067 Mon Sep 17 00:00:00 2001
+From: Wray151 <zheyuan.zhang@intel.com>
+Date: Mon, 28 Nov 2022 08:57:22 -0500
+Subject: [PATCH] IVTAL ffmpeg2.6 release/1.0
+
+---
+ ffmpeg.c               | 16 +++++++++++-
+ libavcodec/avcodec.h   |  1 +
+ libavcodec/h264.c      |  6 ++---
+ libavcodec/hevc.c      |  6 ++---
+ libavformat/avformat.h |  2 ++
+ libavformat/mov.c      | 56 ++++++++++++++++++++++++++++++++++++++++++
+ libavformat/utils.c    |  3 +++
+ 7 files changed, 83 insertions(+), 7 deletions(-)
+
+diff --git a/ffmpeg.c b/ffmpeg.c
+index 895d4bf829..91f4dace77 100644
+--- a/ffmpeg.c
++++ b/ffmpeg.c
+@@ -3113,7 +3113,21 @@ static int transcode_init(void)
+             av_dict_set(&ost->encoder_opts, "side_data_only_packets", "1", 0);
+ 
+             if (ost->enc->type == AVMEDIA_TYPE_VIDEO )
+-                ost->enc_ctx->myFrame = input_streams[i]->dec_ctx->myFrame;//should be a global myframe buf
++            {
++                for(int find_myFrame = 0; find_myFrame < nb_output_streams; find_myFrame++)
++                {
++                    if(input_streams[find_myFrame]->dec_ctx->myFrame!=NULL)
++                    {
++                        ost->enc_ctx->myFrame = input_streams[find_myFrame]->dec_ctx->myFrame;//should be a global myframe buf
++                    }
++                }
++
++                if( ost->enc_ctx->myFrame == NULL )
++                {
++                    ost->enc_ctx->i_use_remv = 0;//decode data not found
++                    printf("mvreuse init fault, mvreuse = 0\n");
++                }
++            }
+ 
+             if ((ret = avcodec_open2(ost->enc_ctx, codec, &ost->encoder_opts)) < 0) {
+                 if (ret == AVERROR_EXPERIMENTAL)
+diff --git a/libavcodec/avcodec.h b/libavcodec/avcodec.h
+index 2e491ff768..7e6701b6e7 100644
+--- a/libavcodec/avcodec.h
++++ b/libavcodec/avcodec.h
+@@ -3143,6 +3143,7 @@ typedef struct AVCodecContext {
+     int i_use_remv;
+     int i_use_remv_fref;
+     int i_jnd_decqp;
++    int video_delay;
+ } AVCodecContext;
+ 
+ AVRational av_codec_get_pkt_timebase         (const AVCodecContext *avctx);
+diff --git a/libavcodec/h264.c b/libavcodec/h264.c
+index 7140f6783d..bdd72f0102 100644
+--- a/libavcodec/h264.c
++++ b/libavcodec/h264.c
+@@ -1830,7 +1830,7 @@ static int h264_decode_frame(AVCodecContext *avctx, void *data,
+                 SPS *sps                           = (h->sps_buffers[h->sps_id]);
+                 PPS *pps                           = (h->pps_buffers[h->pps_id]);
+                 pict->myFrame->i_frame              = h->avctx->i_input_number - h->avctx->has_b_frames;
+-                pict->myFrame->num_reorder_frames   = sps->num_reorder_frames;
++                pict->myFrame->num_reorder_frames   = (h->avctx->has_b_frames>0||h->avctx->video_delay)?1:0;
+                 pict->myFrame->ref_max              = sps->ref_frame_count;
+                 pict->myFrame->framerate            = sps->time_scale / 2;
+                 pict->myFrame->ref_count[0]         = pps->ref_count[0];
+@@ -1904,7 +1904,7 @@ static int h264_decode_frame(AVCodecContext *avctx, void *data,
+             SPS *sps                           = (h->sps_buffers[h->sps_id]);
+             PPS *pps                           = (h->pps_buffers[h->pps_id]);
+             avctx->myFrame->i_frame              = 0;
+-            avctx->myFrame->num_reorder_frames   = sps->num_reorder_frames;
++            avctx->myFrame->num_reorder_frames   = (h->avctx->has_b_frames>0||h->avctx->video_delay>0)?1:0;//sps->num_reorder_frames;
+             avctx->myFrame->ref_max              = sps->ref_frame_count;
+             avctx->myFrame->framerate            = sps->time_scale / 2;
+             avctx->myFrame->ref_count[0]         = pps->ref_count[0];
+@@ -1958,7 +1958,7 @@ static int h264_decode_frame(AVCodecContext *avctx, void *data,
+                 SPS *sps                           = (h->sps_buffers[h->sps_id]);
+                 PPS *pps                           = (h->pps_buffers[h->pps_id]);
+                 pict->myFrame->i_frame              = h->avctx->i_input_number - h->avctx->has_b_frames;
+-                pict->myFrame->num_reorder_frames   = sps->num_reorder_frames;
++                pict->myFrame->num_reorder_frames   = (h->avctx->has_b_frames>0||h->avctx->video_delay>0)?1:0;//sps->num_reorder_frames;
+                 pict->myFrame->ref_max              = sps->ref_frame_count;
+                 pict->myFrame->framerate            = sps->time_scale / 2;
+                 pict->myFrame->ref_count[0]         = pps->ref_count[0];
+diff --git a/libavcodec/hevc.c b/libavcodec/hevc.c
+index 6533986b20..e04961de3a 100644
+--- a/libavcodec/hevc.c
++++ b/libavcodec/hevc.c
+@@ -3129,7 +3129,7 @@ static int hevc_decode_frame(AVCodecContext *avctx, void *data, int *got_output,
+             HEVCPPS *pps                           = (HEVCPPS*)s->pps;
+             HEVCVPS *vps                           = (HEVCVPS*)s->vps;
+             pict->myFrame->i_frame              = s->avctx->i_input_number - s->avctx->has_b_frames;
+-            pict->myFrame->num_reorder_frames   = sps->temporal_layer[0].num_reorder_pics;
++            pict->myFrame->num_reorder_frames   = (s->avctx->has_b_frames>0)?1:0;//sps->temporal_layer[0].num_reorder_pics;
+             pict->myFrame->ref_max              = log2(sps->log2_max_poc_lsb);
+             // pict->myFrame->framerate            = vps->vps_time_scale / 2;
+             pict->myFrame->ref_count[0]         = pps->num_ref_idx_l0_default_active;
+@@ -3158,7 +3158,7 @@ static int hevc_decode_frame(AVCodecContext *avctx, void *data, int *got_output,
+         HEVCSPS *sps                         = (HEVCSPS*)s->sps;
+         HEVCPPS *pps                         = (HEVCPPS*)s->pps;
+         HEVCVPS *vps                         = (HEVCVPS*)s->vps;
+-        avctx->myFrame->num_reorder_frames   = sps->temporal_layer[0].num_reorder_pics;
++        avctx->myFrame->num_reorder_frames   = (s->avctx->has_b_frames>0)?1:0;//sps->temporal_layer[0].num_reorder_pics;
+         avctx->myFrame->ref_max              = log2(sps->log2_max_poc_lsb);
+         // avctx->myFrame->framerate            = vps->vps_time_scale / 2;
+         avctx->myFrame->ref_count[0]         = pps->num_ref_idx_l0_default_active;
+@@ -3201,7 +3201,7 @@ static int hevc_decode_frame(AVCodecContext *avctx, void *data, int *got_output,
+             HEVCPPS *pps                           = (HEVCPPS*)s->pps;
+             HEVCVPS *vps                           = (HEVCVPS*)s->vps;
+             pict->myFrame->i_frame              = s->avctx->i_input_number - s->avctx->has_b_frames;
+-            pict->myFrame->num_reorder_frames   = sps->temporal_layer[0].num_reorder_pics;
++            pict->myFrame->num_reorder_frames   = (s->avctx->has_b_frames>0)?1:0;//sps->temporal_layer[0].num_reorder_pics;
+             pict->myFrame->ref_max              = log2(sps->log2_max_poc_lsb);
+             // pict->myFrame->framerate            = vps->vps_time_scale / 2;
+             pict->myFrame->ref_count[0]         = pps->num_ref_idx_l0_default_active;
+diff --git a/libavformat/avformat.h b/libavformat/avformat.h
+index dc4aaad6a3..59cd7a9148 100644
+--- a/libavformat/avformat.h
++++ b/libavformat/avformat.h
+@@ -1127,6 +1127,8 @@ typedef struct AVStream {
+      * - decoding: Set by libavformat to calculate sample_aspect_ratio internally
+      */
+     AVRational display_aspect_ratio;
++
++    int video_delay;
+ } AVStream;
+ 
+ AVRational av_stream_get_r_frame_rate(const AVStream *s);
+diff --git a/libavformat/mov.c b/libavformat/mov.c
+index 032e364981..d7a2bef4b0 100644
+--- a/libavformat/mov.c
++++ b/libavformat/mov.c
+@@ -2360,6 +2360,60 @@ static int mov_read_sbgp(MOVContext *c, AVIOContext *pb, MOVAtom atom)
+     return pb->eof_reached ? AVERROR_EOF : 0;
+ }
+ 
++#define MAX_REORDER_DELAY 16
++static void mov_estimate_video_delay(MOVContext *c, AVStream* st)
++{
++    MOVStreamContext *msc = st->priv_data;
++    int ind;
++    int ctts_ind = 0;
++    int ctts_sample = 0;
++    int64_t pts_buf[MAX_REORDER_DELAY + 1]; // Circular buffer to sort pts.
++    int buf_start = 0;
++    int j, r, num_swaps;
++
++    for (j = 0; j < MAX_REORDER_DELAY + 1; j++)
++        pts_buf[j] = INT64_MIN;
++
++    st->video_delay = 0;
++    for (ind = 0; ind < st->nb_index_entries && ctts_ind < msc->ctts_count; ++ind) {
++        // Point j to the last elem of the buffer and insert the current pts there.
++        j = buf_start;
++        buf_start = (buf_start + 1);
++        if (buf_start == MAX_REORDER_DELAY + 1)
++            buf_start = 0;
++
++        pts_buf[j] = st->index_entries[ind].timestamp + msc->ctts_data[ctts_ind].duration;
++
++        // The timestamps that are already in the sorted buffer, and are greater than the
++        // current pts, are exactly the timestamps that need to be buffered to output PTS
++        // in correct sorted order.
++        // Hence the video delay (which is the buffer size used to sort DTS and output PTS),
++        // can be computed as the maximum no. of swaps any particular timestamp needs to
++        // go through, to keep this buffer in sorted order.
++        num_swaps = 0;
++        while (j != buf_start) {
++            r = j - 1;
++            if (r < 0) r = MAX_REORDER_DELAY;
++            if (pts_buf[j] < pts_buf[r]) {
++                FFSWAP(int64_t, pts_buf[j], pts_buf[r]);
++                ++num_swaps;
++            } else {
++                break;
++            }
++            j = r;
++        }
++        st->video_delay = FFMAX(st->video_delay, num_swaps);
++
++        ctts_sample++;
++        if (ctts_sample == msc->ctts_data[ctts_ind].count) {
++            ctts_ind++;
++            ctts_sample = 0;
++        }
++    }
++    av_log(c->fc, AV_LOG_DEBUG, "Setting codecpar->delay to %d for stream st: %d\n",
++            st->video_delay, st->index);
++}
++
+ static void mov_build_index(MOVContext *mov, AVStream *st)
+ {
+     MOVStreamContext *sc = st->priv_data;
+@@ -2600,6 +2654,8 @@ static void mov_build_index(MOVContext *mov, AVStream *st)
+             }
+         }
+     }
++
++    mov_estimate_video_delay(mov, st);
+ }
+ 
+ static int mov_open_dref(AVIOContext **pb, const char *src, MOVDref *ref,
+diff --git a/libavformat/utils.c b/libavformat/utils.c
+index 9c534d4439..56aec5d726 100644
+--- a/libavformat/utils.c
++++ b/libavformat/utils.c
+@@ -2662,7 +2662,10 @@ static int try_decode_frame(AVFormatContext *s, AVStream *st, AVPacket *avpkt,
+         switch (st->codec->codec_type) {
+         case AVMEDIA_TYPE_VIDEO:
+             if(st->codec->i_use_remv||st->codec->i_jnd_decqp)
++            {
+                 st->codec->myFrame = (FrameReuse*)malloc(sizeof(FrameReuse));
++                st->codec->video_delay = st->video_delay;
++            }
+             ret = avcodec_decode_video2(st->codec, frame,
+                                         &got_picture, &pkt);
+             break;
+-- 
+2.27.0
+
