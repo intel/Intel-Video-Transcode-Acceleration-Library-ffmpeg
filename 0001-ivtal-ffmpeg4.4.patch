@@ -1,0 +1,830 @@
+From 7c2f9e36752db0c817bc585702ec970a3754271e Mon Sep 17 00:00:00 2001
+From: Wray151 <zheyuan.zhang@intel.com>
+Date: Tue, 27 Sep 2022 02:47:33 -0400
+Subject: [PATCH] IVTAL ffmpeg4.4 release/1.0
+
+---
+ fftools/ffmpeg.c           | 57 +++++++++++++++++++++++++++++++++
+ fftools/ffmpeg.h           |  1 +
+ fftools/ffmpeg_opt.c       | 46 +++++++++++++++++++++++++++
+ libavcodec/avcodec.h       |  7 ++++
+ libavcodec/h264_cabac.c    | 65 ++++++++++++++++++++++++++++++++++++++
+ libavcodec/h264_cavlc.c    | 65 ++++++++++++++++++++++++++++++++++++++
+ libavcodec/h264_mvpred.h   | 24 ++++++++++++++
+ libavcodec/h264_ps.c       |  2 ++
+ libavcodec/h264_ps.h       |  2 ++
+ libavcodec/h264_slice.c    |  8 +++++
+ libavcodec/h264dec.c       | 38 +++++++++++++++++++++-
+ libavcodec/h264dec.h       |  2 ++
+ libavcodec/hevc_refs.c     |  7 ++++
+ libavcodec/hevcdec.c       | 51 ++++++++++++++++++++++++++++++
+ libavcodec/libx264.c       |  9 ++++++
+ libavcodec/mpegutils.c     |  2 ++
+ libavcodec/options_table.h |  3 ++
+ libavcodec/pthread_frame.c |  1 +
+ libavutil/frame.c          |  2 ++
+ libavutil/frame.h          | 60 +++++++++++++++++++++++++++++++++++
+ 20 files changed, 451 insertions(+), 1 deletion(-)
+
+diff --git a/fftools/ffmpeg.c b/fftools/ffmpeg.c
+index dec012a299..fd37cdd159 100644
+--- a/fftools/ffmpeg.c
++++ b/fftools/ffmpeg.c
+@@ -152,6 +152,7 @@ int        nb_input_files   = 0;
+ 
+ OutputStream **output_streams = NULL;
+ int         nb_output_streams = 0;
++int         nb_output_video_streams = 0;
+ OutputFile   **output_files   = NULL;
+ int         nb_output_files   = 0;
+ 
+@@ -1157,6 +1158,8 @@ static void do_video_out(OutputFile *of,
+     int frame_size = 0;
+     InputStream *ist = NULL;
+     AVFilterContext *filter = ost->filter->filter;
++    int next_duplicate = 0;
++    int dup_frame_mode = 1;
+ 
+     init_output_stream_wrapper(ost, next_picture, 1);
+     sync_ipts = adjust_frame_pts_to_encoder_tb(of, ost, next_picture);
+@@ -1288,6 +1291,13 @@ static void do_video_out(OutputFile *of,
+     }
+     ost->last_dropped = nb_frames == nb0_frames && next_picture;
+ 
++    if( (enc->i_use_remv||enc->i_jnd_decqp) && nb_frames == 0 && next_picture )
++    {
++        next_picture->myFrame->output_stream_drop_count++;
++        if ( next_picture->myFrame->output_stream_drop_count == nb_output_video_streams )
++            free( next_picture->myFrame );
++    }
++
+     /* duplicates frame if needed */
+     for (i = 0; i < nb_frames; i++) {
+         AVFrame *in_picture;
+@@ -1296,9 +1306,47 @@ static void do_video_out(OutputFile *of,
+ 
+         if (i < nb0_frames && ost->last_frame) {
+             in_picture = ost->last_frame;
++            if( enc->i_use_remv||enc->i_jnd_decqp )
++            {
++                if( in_picture->myFrame->is_dup_frame == 0 )
++                    dup_frame_mode = in_picture->myFrame->num_reorder_frames > 0;
++                else
++                    dup_frame_mode = in_picture->myFrame->is_dup_frame!=1;
++                in_picture->myFrame = (FrameReuse*)malloc(sizeof(FrameReuse));
++                in_picture->myFrame->i_frame = -1; //dup frame
++                if( dup_frame_mode )
++                {
++                    in_picture->myFrame->is_dup_frame = 2;
++                    in_picture->myFrame->i_frame_type = (nb_frames > 16)?2:3;
++                }
++                else
++                    in_picture->myFrame->is_dup_frame = 1;
++            }
+         } else
++        {
+             in_picture = next_picture;
+ 
++            if( enc->i_use_remv||enc->i_jnd_decqp )
++            {
++                if(next_duplicate++)
++                {
++                    if( in_picture->myFrame->is_dup_frame == 0 )
++                        dup_frame_mode = in_picture->myFrame->num_reorder_frames > 0;
++                    else
++                        dup_frame_mode = in_picture->myFrame->is_dup_frame!=1;
++                    in_picture->myFrame = (FrameReuse*)malloc(sizeof(FrameReuse));
++                    in_picture->myFrame->i_frame = -1; //dup frame
++                    if( dup_frame_mode )
++                    {
++                        in_picture->myFrame->is_dup_frame = 2;
++                        in_picture->myFrame->i_frame_type = (nb_frames > 16)?2:3;
++                    }
++                    else
++                        in_picture->myFrame->is_dup_frame = 1;
++                }
++            }
++        }
++
+         if (!in_picture)
+             return;
+ 
+@@ -1307,6 +1355,12 @@ static void do_video_out(OutputFile *of,
+         if (!check_recording_time(ost))
+             return;
+ 
++        if (ost->enc_ctx->i_use_remv && in_picture->myFrame)
++        {
++            in_picture->myFrame->output_stream_count = 0;
++            in_picture->myFrame->output_stream_num = nb_output_video_streams;
++        }
++
+         in_picture->quality = enc->global_quality;
+         in_picture->pict_type = 0;
+ 
+@@ -3586,6 +3640,9 @@ static int init_output_stream(OutputStream *ost, AVFrame *frame,
+             }
+         }
+ 
++        if (ost->enc->type == AVMEDIA_TYPE_VIDEO)
++            ost->enc_ctx->myFrame = frame->myFrame;//should be a global myframe buf
++
+         if ((ret = avcodec_open2(ost->enc_ctx, codec, &ost->encoder_opts)) < 0) {
+             if (ret == AVERROR_EXPERIMENTAL)
+                 abort_codec_experimental(codec, 1);
+diff --git a/fftools/ffmpeg.h b/fftools/ffmpeg.h
+index 606f2afe0c..f583af56a5 100644
+--- a/fftools/ffmpeg.h
++++ b/fftools/ffmpeg.h
+@@ -592,6 +592,7 @@ extern int        nb_input_files;
+ 
+ extern OutputStream **output_streams;
+ extern int         nb_output_streams;
++extern int         nb_output_video_streams;
+ extern OutputFile   **output_files;
+ extern int         nb_output_files;
+ 
+diff --git a/fftools/ffmpeg_opt.c b/fftools/ffmpeg_opt.c
+index 807e783422..e61036b0c3 100644
+--- a/fftools/ffmpeg_opt.c
++++ b/fftools/ffmpeg_opt.c
+@@ -187,6 +187,9 @@ static int input_stream_potentially_available = 0;
+ static int ignore_unknown_streams = 0;
+ static int copy_unknown_streams = 0;
+ static int find_stream_info = 1;
++static int cmd_i_use_remv      = 0;
++static int cmd_i_use_remv_fref = 0;
++static int cmd_i_jnd_decqp    = 0;
+ 
+ static void uninit_options(OptionsContext *o)
+ {
+@@ -1440,6 +1443,22 @@ static OutputStream *new_output_stream(OptionsContext *o, AVFormatContext *oc, e
+         st->id = o->streamid_map[oc->nb_streams - 1];
+ 
+     GROW_ARRAY(output_streams, nb_output_streams);
++
++    if (type == AVMEDIA_TYPE_VIDEO)
++    {
++        int is_yadiff = 0;
++        for (int i = 0; i < nb_filtergraphs; i++)
++            if (filtergraphs[i]->graph_desc)
++            {
++                is_yadiff = (strstr(filtergraphs[i]->graph_desc, "yadif=1") != NULL ? 1 : 0);
++                break;
++            }
++        if (is_yadiff)
++            nb_output_video_streams+=2;
++        else
++            nb_output_video_streams++;
++    }
++
+     if (!(ost = av_mallocz(sizeof(*ost))))
+         exit_program(1);
+     output_streams[nb_output_streams - 1] = ost;
+@@ -3326,6 +3345,27 @@ static int open_files(OptionGroupList *l, const char *inout,
+         init_options(&o);
+         o.g = g;
+ 
++        if( cmd_i_use_remv > 0 )
++        {
++            char cmd_us_use_remv[2];
++            sprintf(cmd_us_use_remv, "%d", cmd_i_use_remv);
++            av_dict_set(&((&o)->g->codec_opts), "mvreuse", cmd_us_use_remv, 0);
++        }
++
++        if( cmd_i_use_remv_fref > 0 )
++        {
++            char cmd_us_use_remv_fref[2];
++            sprintf(cmd_us_use_remv_fref, "%d", cmd_i_use_remv_fref);
++            av_dict_set(&((&o)->g->codec_opts), "mvreuse-fref", cmd_us_use_remv_fref, 0);
++        }
++
++        if( cmd_i_jnd_decqp > 0 )
++        {
++            char cmd_us_cdef_decqp[2];
++            sprintf(cmd_us_cdef_decqp, "%d", cmd_i_jnd_decqp);
++            av_dict_set(&((&o)->g->codec_opts), "jnd-decqp", cmd_us_cdef_decqp, 0);
++        }
++
+         ret = parse_optgroup(&o, g);
+         if (ret < 0) {
+             av_log(NULL, AV_LOG_ERROR, "Error parsing options for %s file "
+@@ -3713,6 +3753,12 @@ const OptionDef options[] = {
+     { "autoscale",        HAS_ARG | OPT_BOOL | OPT_SPEC |
+                           OPT_EXPERT | OPT_OUTPUT,                               { .off = OFFSET(autoscale) },
+         "automatically insert a scale filter at the end of the filter graph" },
++    { "mvreuse",          HAS_ARG | OPT_INT,                                     { &cmd_i_use_remv },
++        "MVReuse strategy (0:close 1:gain 2:fast 3:balance 4:custom)", "number" },
++    { "mvreuse-fref",     HAS_ARG | OPT_INT,                                     { &cmd_i_use_remv_fref },
++        "Force ref num while MVReuse", "number" },
++    { "jnd-decqp",       HAS_ARG | OPT_INT,                                     { &cmd_i_jnd_decqp },
++        "Adaptive CDEF by decode qp", "number" },
+ 
+     /* audio options */
+     { "aframes",        OPT_AUDIO | HAS_ARG  | OPT_PERFILE | OPT_OUTPUT,           { .func_arg = opt_audio_frames },
+diff --git a/libavcodec/avcodec.h b/libavcodec/avcodec.h
+index 8a71c04230..095d5270dd 100644
+--- a/libavcodec/avcodec.h
++++ b/libavcodec/avcodec.h
+@@ -2382,6 +2382,13 @@ typedef struct AVCodecContext {
+      * - decoding: unused
+      */
+     int (*get_encode_buffer)(struct AVCodecContext *s, AVPacket *pkt, int flags);
++
++    // /* MVReuse info */
++    int i_input_number;
++    FrameReuse *myFrame;
++    int i_use_remv;
++    int i_use_remv_fref;
++    int i_jnd_decqp;
+ } AVCodecContext;
+ 
+ #if FF_API_CODEC_GET_SET
+diff --git a/libavcodec/h264_cabac.c b/libavcodec/h264_cabac.c
+index 86f0a412fa..06b3df62c0 100644
+--- a/libavcodec/h264_cabac.c
++++ b/libavcodec/h264_cabac.c
+@@ -2322,6 +2322,65 @@ decode_intra_mb:
+         write_back_motion(h, sl, mb_type);
+    }
+ 
++   if(h->avctx->i_use_remv == 2 || h->avctx->i_use_remv == 3 || h->avctx->i_use_remv == 4)
++   {
++        int i, direction;
++        MVReuse *myMb = &(h->cur_pic_ptr->f->myFrame->myMb[sl->mb_x][sl->mb_y]);
++        int direction_max = ((h->cur_pic.f->pict_type==AV_PICTURE_TYPE_P)?1:2);
++        const int b_stride      = h->b_stride;
++        const int b_xy  = 4 * sl->mb_x + 4 * sl->mb_y * h->b_stride; // try mb2b(8)_xy
++        const int b8_xy = 4 * sl->mb_xy;
++        for (direction = 0; direction < direction_max; direction++) {
++            if (IS_8X8(mb_type)) {
++                myMb->i_type = 5;
++                myMb->i_part = 13;
++                for (i = 0; i < 4; i++) {
++                    myMb->sub_mb[i].mv[direction][0] = h->cur_pic.motion_val[direction][b_xy+i*b_stride][0];
++                    myMb->sub_mb[i].mv[direction][1] = h->cur_pic.motion_val[direction][b_xy+i*b_stride][1];
++                    int ref = h->cur_pic.ref_index[direction][b8_xy+i];
++                    myMb->sub_mb[i].i_ref[direction] = (ref==-1)?0:ref;
++                }
++            }
++            else if (IS_16X8(mb_type)) {
++                myMb->i_type = 4;
++                myMb->i_part = 14;
++                for (i = 0; i < 2; i++) {
++                    myMb->sub_mb[i].mv[direction][0] = h->cur_pic.motion_val[direction][b_xy+i*b_stride][0];
++                    myMb->sub_mb[i].mv[direction][1] = h->cur_pic.motion_val[direction][b_xy+i*b_stride][1];
++                    int ref = h->cur_pic.ref_index[direction][b8_xy+(i*2)];
++                    myMb->sub_mb[i].i_ref[direction] = (ref==-1)?0:ref;
++                    if (IS_INTERLACED(mb_type))
++                        myMb->sub_mb[i].mv[direction][1]*=2;
++                }
++            }
++            else if (IS_8X16(mb_type)) {
++                myMb->i_type = 4;
++                myMb->i_part = 15;
++                for (i = 0; i < 2; i++) {
++                    myMb->sub_mb[i].mv[direction][0] = h->cur_pic.motion_val[direction][b_xy+i*b_stride][0];
++                    myMb->sub_mb[i].mv[direction][1] = h->cur_pic.motion_val[direction][b_xy+i*b_stride][1];
++                    int ref = h->cur_pic.ref_index[direction][b8_xy+(i*2)];
++                    myMb->sub_mb[i].i_ref[direction] = (ref==-1)?0:ref;
++                    if (IS_INTERLACED(mb_type))
++                        myMb->sub_mb[i].mv[direction][1]*=2;
++                }
++            }
++            else if (IS_16X16(mb_type)) {
++                myMb->i_type = 4;
++                myMb->i_part = 16;
++                myMb->sub_mb[0].mv[direction][0] = h->cur_pic.motion_val[direction][b_xy][0];
++                myMb->sub_mb[0].mv[direction][1] = h->cur_pic.motion_val[direction][b_xy][1];
++                int ref = h->cur_pic.ref_index[direction][b8_xy];
++                myMb->sub_mb[0].i_ref[direction] = (ref==-1)?0:ref;
++            }
++            else
++            {
++                myMb->i_type = 0;
++                myMb->i_part = 0;
++            }
++        }
++    }
++
+     if( !IS_INTRA16x16( mb_type ) ) {
+         cbp  = decode_cabac_mb_cbp_luma(sl);
+         if(decode_chroma)
+@@ -2486,5 +2545,11 @@ decode_intra_mb:
+     h->cur_pic.qscale_table[mb_xy] = sl->qscale;
+     write_back_non_zero_count(h, sl);
+ 
++    if(h->avctx->i_jnd_decqp || h->avctx->i_use_remv)
++    {
++        h->cur_pic_ptr->f->myFrame->myMb[sl->mb_x][sl->mb_y].i_skip_qp_get_flag = 1;//non-skip qp get flag
++        h->cur_pic_ptr->f->myFrame->myMb[sl->mb_x][sl->mb_y].i_qp_aq = sl->qscale;
++    }
++
+     return 0;
+ }
+diff --git a/libavcodec/h264_cavlc.c b/libavcodec/h264_cavlc.c
+index 9f5f692331..fa453e28cd 100644
+--- a/libavcodec/h264_cavlc.c
++++ b/libavcodec/h264_cavlc.c
+@@ -1061,6 +1061,65 @@ decode_intra_mb:
+     if(IS_INTER(mb_type))
+         write_back_motion(h, sl, mb_type);
+ 
++    if(h->avctx->i_use_remv == 2 || h->avctx->i_use_remv == 3 || h->avctx->i_use_remv == 4)
++    {
++        int i, direction;
++        MVReuse *myMb = &(h->cur_pic_ptr->f->myFrame->myMb[sl->mb_x][sl->mb_y]);
++        int direction_max = ((h->cur_pic.f->pict_type==AV_PICTURE_TYPE_P)?1:2);
++        const int b_stride      = h->b_stride;
++        const int b_xy  = 4 * sl->mb_x + 4 * sl->mb_y * h->b_stride; // try mb2b(8)_xy
++        const int b8_xy = 4 * sl->mb_xy;
++        for (direction = 0; direction < direction_max; direction++) {
++            if (IS_8X8(mb_type)) {
++                myMb->i_type = 5;
++                myMb->i_part = 13;
++                for (i = 0; i < 4; i++) {
++                    myMb->sub_mb[i].mv[direction][0] = h->cur_pic.motion_val[direction][b_xy+i*b_stride][0];
++                    myMb->sub_mb[i].mv[direction][1] = h->cur_pic.motion_val[direction][b_xy+i*b_stride][1];
++                    int ref = h->cur_pic.ref_index[direction][b8_xy+i];
++                    myMb->sub_mb[i].i_ref[direction] = (ref==-1)?0:ref;
++                }
++            }
++            else if (IS_16X8(mb_type)) {
++                myMb->i_type = 4;
++                myMb->i_part = 14;
++                for (i = 0; i < 2; i++) {
++                    myMb->sub_mb[i].mv[direction][0] = h->cur_pic.motion_val[direction][b_xy+i*b_stride][0];
++                    myMb->sub_mb[i].mv[direction][1] = h->cur_pic.motion_val[direction][b_xy+i*b_stride][1];
++                    int ref = h->cur_pic.ref_index[direction][b8_xy+(i*2)];
++                    myMb->sub_mb[i].i_ref[direction] = (ref==-1)?0:ref;
++                    if (IS_INTERLACED(mb_type))
++                        myMb->sub_mb[i].mv[direction][1]*=2;
++                }
++            }
++            else if (IS_8X16(mb_type)) {
++                myMb->i_type = 4;
++                myMb->i_part = 15;
++                for (i = 0; i < 2; i++) {
++                    myMb->sub_mb[i].mv[direction][0] = h->cur_pic.motion_val[direction][b_xy+i*b_stride][0];
++                    myMb->sub_mb[i].mv[direction][1] = h->cur_pic.motion_val[direction][b_xy+i*b_stride][1];
++                    int ref = h->cur_pic.ref_index[direction][b8_xy+(i*2)];
++                    myMb->sub_mb[i].i_ref[direction] = (ref==-1)?0:ref;
++                    if (IS_INTERLACED(mb_type))
++                        myMb->sub_mb[i].mv[direction][1]*=2;
++                }
++            }
++            else if (IS_16X16(mb_type)) {
++                myMb->i_type = 4;
++                myMb->i_part = 16;
++                myMb->sub_mb[0].mv[direction][0] = h->cur_pic.motion_val[direction][b_xy][0];
++                myMb->sub_mb[0].mv[direction][1] = h->cur_pic.motion_val[direction][b_xy][1];
++                int ref = h->cur_pic.ref_index[direction][b8_xy];
++                myMb->sub_mb[0].i_ref[direction] = (ref==-1)?0:ref;
++            }
++            else
++            {
++                myMb->i_type = 0;
++                myMb->i_part = 0;
++            }
++        }
++    }
++
+     if(!IS_INTRA16x16(mb_type)){
+         cbp= get_ue_golomb(&sl->gb);
+ 
+@@ -1178,5 +1237,11 @@ decode_intra_mb:
+     h->cur_pic.qscale_table[mb_xy] = sl->qscale;
+     write_back_non_zero_count(h, sl);
+ 
++    if(h->avctx->i_jnd_decqp || h->avctx->i_use_remv)
++    {
++        h->cur_pic_ptr->f->myFrame->myMb[sl->mb_x][sl->mb_y].i_skip_qp_get_flag = 1;//non-skip qp get flag
++        h->cur_pic_ptr->f->myFrame->myMb[sl->mb_x][sl->mb_y].i_qp_aq = sl->qscale;
++    }
++
+     return 0;
+ }
+diff --git a/libavcodec/h264_mvpred.h b/libavcodec/h264_mvpred.h
+index 19d9ee462d..2d5ed5f79b 100644
+--- a/libavcodec/h264_mvpred.h
++++ b/libavcodec/h264_mvpred.h
+@@ -832,6 +832,30 @@ static void av_unused decode_mb_skip(const H264Context *h, H264SliceContext *sl)
+     h->cur_pic.qscale_table[mb_xy] = sl->qscale;
+     h->slice_table[mb_xy]          = sl->slice_num;
+     sl->prev_mb_skipped            = 1;
++
++    if(h->avctx->i_use_remv == 2 || h->avctx->i_use_remv == 3 || h->avctx->i_use_remv == 4) //for skip
++    {
++        int direction;
++        MVReuse *myMb = &(h->cur_pic_ptr->f->myFrame->myMb[sl->mb_x][sl->mb_y]);
++        int direction_max = ((h->cur_pic.f->pict_type==AV_PICTURE_TYPE_P)?1:2);
++        const int b_stride      = h->b_stride;
++        const int b_xy  = 4 * sl->mb_x + 4 * sl->mb_y * h->b_stride; // try mb2b(8)_xy
++        const int b8_xy = 4 * sl->mb_xy;
++        for (direction = 0; direction < direction_max; direction++) {
++            myMb->i_type = 6;
++            myMb->i_part = 16;
++            myMb->sub_mb[0].mv[direction][0] = h->cur_pic.motion_val[direction][b_xy][0];
++            myMb->sub_mb[0].mv[direction][1] = h->cur_pic.motion_val[direction][b_xy][1];
++            int ref = h->cur_pic.ref_index[direction][b8_xy];
++            myMb->sub_mb[0].i_ref[direction] = (ref==-1)?0:ref;
++        }
++    }
++
++    if(h->avctx->i_jnd_decqp || h->avctx->i_use_remv)
++    {
++        h->cur_pic_ptr->f->myFrame->myMb[sl->mb_x][sl->mb_y].i_skip_qp_get_flag = 0;//skip qp get flag
++        h->cur_pic_ptr->f->myFrame->myMb[sl->mb_x][sl->mb_y].i_qp_aq = sl->qscale;//skip qp get
++    }
+ }
+ 
+ #endif /* AVCODEC_H264_MVPRED_H */
+diff --git a/libavcodec/h264_ps.c b/libavcodec/h264_ps.c
+index e21c2b56ac..2a2de4df9f 100644
+--- a/libavcodec/h264_ps.c
++++ b/libavcodec/h264_ps.c
+@@ -368,6 +368,7 @@ int ff_h264_decode_seq_parameter_set(GetBitContext *gb, AVCodecContext *avctx,
+         goto fail;
+     }
+ 
++    ps->sps_id                = sps_id;
+     sps->sps_id               = sps_id;
+     sps->time_offset_length   = 24;
+     sps->profile_idc          = profile_idc;
+@@ -762,6 +763,7 @@ int ff_h264_decode_picture_parameter_set(GetBitContext *gb, AVCodecContext *avct
+         return AVERROR_INVALIDDATA;
+     }
+ 
++    ps->pps_id = pps_id;
+     pps = av_mallocz(sizeof(*pps));
+     if (!pps)
+         return AVERROR(ENOMEM);
+diff --git a/libavcodec/h264_ps.h b/libavcodec/h264_ps.h
+index 3f1ab72e38..09230f270d 100644
+--- a/libavcodec/h264_ps.h
++++ b/libavcodec/h264_ps.h
+@@ -150,6 +150,8 @@ typedef struct H264ParamSets {
+     const SPS *sps;
+ 
+     int overread_warning_printed[2];
++    int sps_id; //get sps for mvreuse
++    int pps_id; //get pps for mvreuse
+ } H264ParamSets;
+ 
+ /**
+diff --git a/libavcodec/h264_slice.c b/libavcodec/h264_slice.c
+index 7c69016338..0c1e834a2d 100644
+--- a/libavcodec/h264_slice.c
++++ b/libavcodec/h264_slice.c
+@@ -233,6 +233,13 @@ static int alloc_picture(H264Context *h, H264Picture *pic)
+     pic->mb_type      = (uint32_t*)pic->mb_type_buf->data + 2 * h->mb_stride + 1;
+     pic->qscale_table = pic->qscale_table_buf->data + 2 * h->mb_stride + 1;
+ 
++    if( h->avctx->i_use_remv||h->avctx->i_jnd_decqp )
++    {
++        pic->f->myFrame = (FrameReuse*)malloc(sizeof(FrameReuse));
++        pic->f->myFrame->output_stream_drop_count = 0;
++        pic->f->myFrame->is_dup_frame = 0;
++    }
++
+     for (i = 0; i < 2; i++) {
+         pic->motion_val_buf[i] = av_buffer_pool_get(h->motion_val_pool);
+         pic->ref_index_buf[i]  = av_buffer_pool_get(h->ref_index_pool);
+@@ -506,6 +513,7 @@ static int h264_frame_start(H264Context *h)
+     pic->f->crop_right  = h->crop_right;
+     pic->f->crop_top    = h->crop_top;
+     pic->f->crop_bottom = h->crop_bottom;
++    pic->f->bref        = (h->nal_ref_idc==0)?0:1;
+ 
+     if ((ret = alloc_picture(h, pic)) < 0)
+         return ret;
+diff --git a/libavcodec/h264dec.c b/libavcodec/h264dec.c
+index bf3ab88da4..766c069d33 100644
+--- a/libavcodec/h264dec.c
++++ b/libavcodec/h264dec.c
+@@ -34,7 +34,6 @@
+ #include "libavutil/stereo3d.h"
+ #include "libavutil/video_enc_params.h"
+ 
+-#include "internal.h"
+ #include "bytestream.h"
+ #include "cabac.h"
+ #include "cabac_functions.h"
+@@ -910,6 +909,43 @@ static int finalize_frame(H264Context *h, AVFrame *dst, H264Picture *out, int *g
+         if (ret < 0)
+             return ret;
+ 
++        if (h->avctx->i_use_remv || h->avctx->i_jnd_decqp) {
++
++            H264ParamSets *ps                  = &(((H264Context*)(h->avctx)->priv_data)->ps);
++            SPS *sps                           = (SPS*)(ps->sps_list[ps->sps->sps_id]->data);
++            PPS *pps                           = (PPS*)(ps->pps_list[ps->sps->sps_id]->data);
++            dst->myFrame->i_frame              = h->avctx->i_input_number - h->avctx->has_b_frames;
++            dst->myFrame->num_reorder_frames   = (h->avctx->has_b_frames>0)?1:0;
++            dst->myFrame->ref_max              = sps->ref_frame_count;
++            if(sps->num_units_in_tick != 0)
++                dst->myFrame->framerate            = sps->time_scale / sps->num_units_in_tick / 2;
++            dst->myFrame->ref_count[0]         = pps->ref_count[0];
++            dst->myFrame->ref_count[1]         = pps->ref_count[1];
++            dst->myFrame->weighted_pred        = pps->weighted_pred?1:0;
++            if(dst->pict_type == 3)
++                dst->myFrame->i_frame_type    = dst->bref?4:3;
++            else
++                dst->myFrame->i_frame_type    = dst->pict_type;
++            dst->myFrame->in_width            = h->avctx->width;
++            dst->myFrame->in_height           = h->avctx->height;
++            dst->myFrame->is_dup_frame        = 0;
++
++            int qp_count = 0;
++            dst->myFrame->i_frame_avg_qp_aq   = 0;
++            for(int i=0;i<sps->mb_width;i++)
++            {
++                for(int j=0;j<sps->mb_height;j++)
++                {
++                    if(dst->myFrame->myMb[i][j].i_skip_qp_get_flag) //non-skip --VCA
++                    {
++                        dst->myFrame->i_frame_avg_qp_aq+=dst->myFrame->myMb[i][j].i_qp_aq;
++                        qp_count++;
++                    }
++                }
++            }
++            dst->myFrame->i_frame_avg_qp_aq/=qp_count;
++        }
++
+         *got_frame = 1;
+ 
+         if (CONFIG_MPEGVIDEO) {
+diff --git a/libavcodec/h264dec.h b/libavcodec/h264dec.h
+index b3677cdbb9..25b1029689 100644
+--- a/libavcodec/h264dec.h
++++ b/libavcodec/h264dec.h
+@@ -168,6 +168,8 @@ typedef struct H264Picture {
+ 
+     int mb_width, mb_height;
+     int mb_stride;
++
++    FrameReuse *myFrame;
+ } H264Picture;
+ 
+ typedef struct H264Ref {
+diff --git a/libavcodec/hevc_refs.c b/libavcodec/hevc_refs.c
+index 4f6d985ae6..6cb0eea515 100644
+--- a/libavcodec/hevc_refs.c
++++ b/libavcodec/hevc_refs.c
+@@ -96,6 +96,13 @@ static HEVCFrame *alloc_frame(HEVCContext *s)
+         if (!frame->rpl_buf)
+             goto fail;
+ 
++        if( s->avctx->i_use_remv||s->avctx->i_jnd_decqp )
++        {
++            frame->frame->myFrame = (FrameReuse*)malloc(sizeof(FrameReuse));
++            frame->frame->myFrame->output_stream_drop_count = 0;
++            frame->frame->myFrame->is_dup_frame = 0;
++        }
++
+         frame->tab_mvf_buf = av_buffer_pool_get(s->tab_mvf_pool);
+         if (!frame->tab_mvf_buf)
+             goto fail;
+diff --git a/libavcodec/hevcdec.c b/libavcodec/hevcdec.c
+index 19d6d517f3..e7419bbc9a 100644
+--- a/libavcodec/hevcdec.c
++++ b/libavcodec/hevcdec.c
+@@ -2919,6 +2919,8 @@ static int hevc_frame_start(HEVCContext *s)
+     if (ret < 0)
+         goto fail;
+ 
++    s->frame->bref = s->nal_unit_type;
++
+     ret = ff_hevc_frame_rps(s);
+     if (ret < 0) {
+         av_log(s->avctx, AV_LOG_ERROR, "Error constructing the frame RPS.\n");
+@@ -3306,6 +3308,7 @@ static int hevc_decode_frame(AVCodecContext *avctx, void *data, int *got_output,
+     buffer_size_t new_extradata_size;
+     uint8_t *new_extradata;
+     HEVCContext *s = avctx->priv_data;
++    AVFrame *pict;
+ 
+     if (!avpkt->size) {
+         ret = ff_hevc_output_frame(s, data, 1);
+@@ -3313,6 +3316,31 @@ static int hevc_decode_frame(AVCodecContext *avctx, void *data, int *got_output,
+             return ret;
+ 
+         *got_output = ret;
++
++        if ((s->avctx->i_use_remv || s->avctx->i_jnd_decqp)&&(*got_output)) {
++
++            pict = data;
++
++            HEVCSPS *sps                           = (HEVCSPS*)s->ps.sps;
++            HEVCPPS *pps                           = (HEVCPPS*)s->ps.pps;
++            HEVCVPS *vps                           = (HEVCVPS*)s->ps.vps;
++            pict->myFrame->i_frame              = s->avctx->i_input_number - s->avctx->has_b_frames;
++            pict->myFrame->num_reorder_frames   = (s->avctx->has_b_frames>0)?1:0;//sps->temporal_layer[0].num_reorder_pics;
++            pict->myFrame->ref_max              = log2(sps->log2_max_poc_lsb);
++            // pict->myFrame->framerate            = vps->vps_time_scale / 2;
++            pict->myFrame->ref_count[0]         = pps->num_ref_idx_l0_default_active;
++            pict->myFrame->ref_count[1]         = pps->num_ref_idx_l1_default_active;
++            pict->myFrame->weighted_pred        = pps->weighted_pred_flag;
++            if(pict->pict_type == 1)
++                pict->myFrame->i_frame_type    = (pict->bref==HEVC_NAL_IDR_N_LP)?1:5;
++            else if(pict->pict_type == 3)
++                pict->myFrame->i_frame_type    = (pict->bref==HEVC_NAL_TRAIL_R||pict->bref==HEVC_NAL_RASL_R)?4:3;
++            else
++                pict->myFrame->i_frame_type    = pict->pict_type;
++            // pict->myFrame->in_width            = s->avctx->width;
++            // pict->myFrame->in_height           = s->avctx->height;
++            pict->myFrame->is_dup_frame        = 0;
++        }
+         return 0;
+     }
+ 
+@@ -3356,6 +3384,29 @@ static int hevc_decode_frame(AVCodecContext *avctx, void *data, int *got_output,
+ 
+     if (s->output_frame->buf[0]) {
+         av_frame_move_ref(data, s->output_frame);
++        if (s->avctx->i_use_remv || s->avctx->i_jnd_decqp) {
++
++            pict = data;
++
++            HEVCSPS *sps                           = (HEVCSPS*)s->ps.sps;
++            HEVCPPS *pps                           = (HEVCPPS*)s->ps.pps;
++            HEVCVPS *vps                           = (HEVCVPS*)s->ps.vps;
++            pict->myFrame->i_frame              = s->avctx->i_input_number - s->avctx->has_b_frames;
++            pict->myFrame->num_reorder_frames   = (s->avctx->has_b_frames>0)?1:0;//sps->temporal_layer[0].num_reorder_pics;
++            pict->myFrame->ref_max              = log2(sps->log2_max_poc_lsb);
++            // pict->myFrame->framerate            = 1 / (s->avctx->time_base.num / s->avctx->time_base.den);
++            pict->myFrame->ref_count[1]         = pps->num_ref_idx_l1_default_active;
++            pict->myFrame->weighted_pred        = pps->weighted_pred_flag;
++            if(pict->pict_type == 1)
++                pict->myFrame->i_frame_type    = (pict->bref==HEVC_NAL_IDR_N_LP)?1:5;
++            else if(pict->pict_type == 3)
++                pict->myFrame->i_frame_type    = (pict->bref==HEVC_NAL_TRAIL_R||pict->bref==HEVC_NAL_RASL_R)?4:3;
++            else
++                pict->myFrame->i_frame_type    = pict->pict_type;
++            pict->myFrame->in_width            = s->avctx->width;
++            pict->myFrame->in_height           = s->avctx->height;
++            pict->myFrame->is_dup_frame        = 0;
++        }
+         *got_output = 1;
+     }
+ 
+diff --git a/libavcodec/libx264.c b/libavcodec/libx264.c
+index 4ddc4973a4..d72c3b0855 100644
+--- a/libavcodec/libx264.c
++++ b/libavcodec/libx264.c
+@@ -322,6 +322,7 @@ static int X264_frame(AVCodecContext *ctx, AVPacket *pkt, const AVFrame *frame,
+         }
+ 
+         x4->pic.i_pts  = frame->pts;
++        x4->pic.myFrame = frame->myFrame;
+ 
+         x4->reordered_opaque[x4->next_reordered_opaque].reordered_opaque = frame->reordered_opaque;
+         x4->reordered_opaque[x4->next_reordered_opaque].wallclock = wallclock;
+@@ -945,6 +946,14 @@ FF_ENABLE_DEPRECATION_WARNINGS
+ 
+     avctx->bit_rate = x4->params.rc.i_bitrate*1000LL;
+ 
++    if( avctx->i_use_remv && detect_avx512() )
++    {
++        x264_param_default_preset_mvreuse(&x4->params, avctx->i_use_remv, avctx->i_jnd_decqp,
++            avctx->myFrame->framerate, avctx->myFrame->num_reorder_frames, avctx->i_use_remv_fref, avctx->myFrame->ref_max, avctx->myFrame->weighted_pred, avctx->gop_size, X264_KEYINT_MAX_INFINITE, avctx->myFrame->in_width, avctx->myFrame->in_height);
++    }
++    else
++        x4->params.i_use_remv = 0;
++
+     x4->enc = x264_encoder_open(&x4->params);
+     if (!x4->enc)
+         return AVERROR_EXTERNAL;
+diff --git a/libavcodec/mpegutils.c b/libavcodec/mpegutils.c
+index e5105ecc58..017f63d632 100644
+--- a/libavcodec/mpegutils.c
++++ b/libavcodec/mpegutils.c
+@@ -26,6 +26,8 @@
+ #include "libavutil/motion_vector.h"
+ #include "libavutil/avassert.h"
+ 
++#include "h264_ps.h"
++#include "h264dec.h"
+ #include "avcodec.h"
+ #include "mpegutils.h"
+ 
+diff --git a/libavcodec/options_table.h b/libavcodec/options_table.h
+index e12159f734..0a4f71a7fa 100644
+--- a/libavcodec/options_table.h
++++ b/libavcodec/options_table.h
+@@ -467,6 +467,9 @@ static const AVOption avcodec_options[] = {
+ {"allow_profile_mismatch", "attempt to decode anyway if HW accelerated decoder's supported profiles do not exactly match the stream", 0, AV_OPT_TYPE_CONST, {.i64 = AV_HWACCEL_FLAG_ALLOW_PROFILE_MISMATCH }, INT_MIN, INT_MAX, V | D, "hwaccel_flags"},
+ {"extra_hw_frames", "Number of extra hardware frames to allocate for the user", OFFSET(extra_hw_frames), AV_OPT_TYPE_INT, { .i64 = -1 }, -1, INT_MAX, V|D },
+ {"discard_damaged_percentage", "Percentage of damaged samples to discard a frame", OFFSET(discard_damaged_percentage), AV_OPT_TYPE_INT, {.i64 = 95 }, 0, 100, V|D },
++{"mvreuse", "MVReuse strategy (0:close 1:gain 2:fast 3:balance 4:custom)", OFFSET(i_use_remv), AV_OPT_TYPE_INT, {.i64 = 0 }, 0, 4, V|D|E},
++{"mvreuse-fref", "Force ref num while MVReuse", OFFSET(i_use_remv_fref), AV_OPT_TYPE_INT, {.i64 = 0 }, 0, 16, V|D|E},
++{"jnd-decqp", "Adaptive CDEF by decode qp", OFFSET(i_jnd_decqp), AV_OPT_TYPE_INT, {.i64 = 0 }, 0, 1, V|D|E},
+ {NULL},
+ };
+ 
+diff --git a/libavcodec/pthread_frame.c b/libavcodec/pthread_frame.c
+index 6f48d2c208..0c3dd51db0 100644
+--- a/libavcodec/pthread_frame.c
++++ b/libavcodec/pthread_frame.c
+@@ -371,6 +371,7 @@ static int update_context_from_user(AVCodecContext *dst, AVCodecContext *src)
+ 
+     dst->frame_number     = src->frame_number;
+     dst->reordered_opaque = src->reordered_opaque;
++    dst->i_input_number   = src->i_input_number++;
+ #if FF_API_THREAD_SAFE_CALLBACKS
+ FF_DISABLE_DEPRECATION_WARNINGS
+     dst->thread_safe_callbacks = src->thread_safe_callbacks;
+diff --git a/libavutil/frame.c b/libavutil/frame.c
+index 75e347bf2f..9942c2a174 100644
+--- a/libavutil/frame.c
++++ b/libavutil/frame.c
+@@ -386,6 +386,8 @@ FF_ENABLE_DEPRECATION_WARNINGS
+     dst->colorspace             = src->colorspace;
+     dst->color_range            = src->color_range;
+     dst->chroma_location        = src->chroma_location;
++    dst->bref                   = src->bref;
++    dst->myFrame                = src->myFrame;
+ 
+     av_dict_copy(&dst->metadata, src->metadata, 0);
+ 
+diff --git a/libavutil/frame.h b/libavutil/frame.h
+index 7d1f8e2935..3cd25f996f 100644
+--- a/libavutil/frame.h
++++ b/libavutil/frame.h
+@@ -210,6 +210,57 @@ enum AVActiveFormatDescription {
+     AV_AFD_SP_4_3       = 15,
+ };
+ 
++/**
++ * MV Reuse.
++ */
++#ifndef _MV_REUSE_
++#define _MV_REUSE_
++
++struct MyInfo {
++    int frame_num;
++    // AVMotionVector *sd;
++    uint32_t *mb_type;
++    int mb_num;
++    int size;
++    uint8_t *data;
++    int my_slice_type;
++    int ref_fra;
++    int ref_flag;
++};
++
++typedef struct MVReuseAVMotionVector {
++    short mv[2][2];
++    int i_ref[2];
++} MVReuseAVMotionVector;
++
++typedef struct MVReuse {
++    int i_type;
++    int i_part;
++    int i_skip_qp_get_flag;
++    int i_qp_aq;
++    MVReuseAVMotionVector sub_mb[4];
++} MVReuse;
++
++typedef struct FrameReuse {
++    int i_frame;
++    int i_frame_type;
++    int weighted_pred;
++    int ref_max;
++    int ref_count[2];
++    int num_reorder_frames;
++    int i_h264_frame_type;
++    int in_width;
++    int in_height;
++    int is_dup_frame;
++    int framerate;
++    float i_frame_avg_qp_aq;
++    int output_stream_count;
++    int output_stream_drop_count;
++    int output_stream_num;
++    MVReuse myMb[300][300];
++    MVReuse myMb_resize[300][300];
++} FrameReuse;
++#endif
+ 
+ /**
+  * Structure to hold side data for an AVFrame.
+@@ -695,6 +746,15 @@ typedef struct AVFrame {
+      * for the target frame's private_ref field.
+      */
+     AVBufferRef *private_ref;
++    /**
++     * b_reference_frame flag
++     */
++    int bref;
++    /**
++     * MVReuse structure
++     */
++    FrameReuse *myFrame;
++
+ } AVFrame;
+ 
+ #if FF_API_FRAME_GET_SET
+-- 
+2.27.0
+
