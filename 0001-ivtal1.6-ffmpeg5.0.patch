@@ -1,35 +1,44 @@
-From ab4d6490b62b82808e8e7beb633314f29735fe08 Mon Sep 17 00:00:00 2001
+From d28f7bc47ec240c9a910274c7b07f6618bc96018 Mon Sep 17 00:00:00 2001
 From: zhangzheyuan <zheyuan.zhang@intel.com>
 Date: Mon, 28 Feb 2022 19:20:21 -0500
-Subject: [PATCH] IVTAL ffmpeg5.0 release/1.0
+Subject: [PATCH] IVTAL ffmpeg5.0 release/1.6
 
 ---
- fftools/ffmpeg.c           | 50 +++++++++++++++++++++++++
- fftools/ffmpeg_opt.c       | 30 +++++++++++++++
+ fftools/ffmpeg.c           | 57 ++++++++++++++++++++++++++++
+ fftools/ffmpeg.h           |  1 +
+ fftools/ffmpeg_opt.c       | 46 +++++++++++++++++++++++
  libavcodec/avcodec.h       |  7 ++++
  libavcodec/h264_cabac.c    | 77 ++++++++++++++++++++++++++++++++++++++
  libavcodec/h264_cavlc.c    | 77 ++++++++++++++++++++++++++++++++++++++
  libavcodec/h264_mvpred.h   | 24 ++++++++++++
  libavcodec/h264_ps.c       |  2 +
  libavcodec/h264_ps.h       |  2 +
- libavcodec/h264_slice.c    |  7 ++++
+ libavcodec/h264_slice.c    |  8 ++++
  libavcodec/h264dec.c       | 38 ++++++++++++++++++-
  libavcodec/h264dec.h       |  2 +
- libavcodec/hevc_refs.c     |  6 +++
+ libavcodec/hevc_refs.c     |  7 ++++
  libavcodec/hevcdec.c       | 52 +++++++++++++++++++++++++
- libavcodec/libx264.c       |  9 +++++
+ libavcodec/libx264.c       | 12 ++++++
  libavcodec/mpegutils.c     |  2 +
  libavcodec/options_table.h |  3 ++
  libavcodec/pthread_frame.c |  1 +
  libavutil/frame.c          |  2 +
- libavutil/frame.h          | 57 ++++++++++++++++++++++++++++
- 19 files changed, 447 insertions(+), 1 deletion(-)
+ libavutil/frame.h          | 60 +++++++++++++++++++++++++++++
+ 20 files changed, 479 insertions(+), 1 deletion(-)
 
 diff --git a/fftools/ffmpeg.c b/fftools/ffmpeg.c
-index bdeff9a12e..32e4d50dc8 100644
+index bdeff9a12e..a9eee602df 100644
 --- a/fftools/ffmpeg.c
 +++ b/fftools/ffmpeg.c
-@@ -1154,6 +1154,8 @@ static void do_video_out(OutputFile *of,
+@@ -152,6 +152,7 @@ int        nb_input_files   = 0;
+ 
+ OutputStream **output_streams = NULL;
+ int         nb_output_streams = 0;
++int         nb_output_video_streams = 0;
+ OutputFile   **output_files   = NULL;
+ int         nb_output_files   = 0;
+ 
+@@ -1154,6 +1155,8 @@ static void do_video_out(OutputFile *of,
      int frame_size = 0;
      InputStream *ist = NULL;
      AVFilterContext *filter = ost->filter->filter;
@@ -38,21 +47,21 @@ index bdeff9a12e..32e4d50dc8 100644
  
      init_output_stream_wrapper(ost, next_picture, 1);
      sync_ipts = adjust_frame_pts_to_encoder_tb(of, ost, next_picture);
-@@ -1268,6 +1270,13 @@ static void do_video_out(OutputFile *of,
+@@ -1268,6 +1271,13 @@ static void do_video_out(OutputFile *of,
      ost->last_dropped = nb_frames == nb0_frames && next_picture;
      ost->dropped_keyframe = ost->last_dropped && next_picture && next_picture->key_frame;
  
-+    //drop frame free
 +    if( (enc->i_use_remv||enc->i_jnd_decqp) && nb_frames == 0 && next_picture )
 +    {
-+        free( next_picture->myFrame );
-+        next_picture->myFrame = NULL;
++        next_picture->myFrame->output_stream_drop_count++;
++        if ( next_picture->myFrame->output_stream_drop_count == nb_output_video_streams )
++            free( next_picture->myFrame );
 +    }
 +
      /* duplicates frame if needed */
      for (i = 0; i < nb_frames; i++) {
          AVFrame *in_picture;
-@@ -1276,9 +1285,47 @@ static void do_video_out(OutputFile *of,
+@@ -1276,9 +1286,47 @@ static void do_video_out(OutputFile *of,
  
          if (i < nb0_frames && ost->last_frame->buf[0]) {
              in_picture = ost->last_frame;
@@ -67,7 +76,7 @@ index bdeff9a12e..32e4d50dc8 100644
 +                if( dup_frame_mode )
 +                {
 +                    in_picture->myFrame->is_dup_frame = 2;
-+                    in_picture->myFrame->i_frame_type = 3;
++                    in_picture->myFrame->i_frame_type = (nb_frames > 16)?2:3;
 +                }
 +                else
 +                    in_picture->myFrame->is_dup_frame = 1;
@@ -89,7 +98,7 @@ index bdeff9a12e..32e4d50dc8 100644
 +                    if( dup_frame_mode )
 +                    {
 +                        in_picture->myFrame->is_dup_frame = 2;
-+                        in_picture->myFrame->i_frame_type = 3;
++                        in_picture->myFrame->i_frame_type = (nb_frames > 16)?2:3;
 +                    }
 +                    else
 +                        in_picture->myFrame->is_dup_frame = 1;
@@ -100,7 +109,20 @@ index bdeff9a12e..32e4d50dc8 100644
          if (!in_picture)
              return;
  
-@@ -3483,6 +3530,9 @@ static int init_output_stream(OutputStream *ost, AVFrame *frame,
+@@ -1287,6 +1335,12 @@ static void do_video_out(OutputFile *of,
+         if (!check_recording_time(ost))
+             return;
+ 
++        if (ost->enc_ctx->i_use_remv && in_picture->myFrame)
++        {
++            in_picture->myFrame->output_stream_count = 0;
++            in_picture->myFrame->output_stream_num = nb_output_video_streams;
++        }
++
+         in_picture->quality = enc->global_quality;
+         in_picture->pict_type = 0;
+ 
+@@ -3483,6 +3537,9 @@ static int init_output_stream(OutputStream *ost, AVFrame *frame,
              }
          }
  
@@ -110,8 +132,20 @@ index bdeff9a12e..32e4d50dc8 100644
          if ((ret = avcodec_open2(ost->enc_ctx, codec, &ost->encoder_opts)) < 0) {
              if (ret == AVERROR_EXPERIMENTAL)
                  abort_codec_experimental(codec, 1);
+diff --git a/fftools/ffmpeg.h b/fftools/ffmpeg.h
+index 9b200b806a..e2e770e797 100644
+--- a/fftools/ffmpeg.h
++++ b/fftools/ffmpeg.h
+@@ -593,6 +593,7 @@ extern int        nb_input_files;
+ 
+ extern OutputStream **output_streams;
+ extern int         nb_output_streams;
++extern int         nb_output_video_streams;
+ extern OutputFile   **output_files;
+ extern int         nb_output_files;
+ 
 diff --git a/fftools/ffmpeg_opt.c b/fftools/ffmpeg_opt.c
-index 9c820ab73f..743f9aad90 100644
+index 9c820ab73f..6ef21dd537 100644
 --- a/fftools/ffmpeg_opt.c
 +++ b/fftools/ffmpeg_opt.c
 @@ -178,6 +178,9 @@ static int ignore_unknown_streams = 0;
@@ -124,7 +158,30 @@ index 9c820ab73f..743f9aad90 100644
  
  static void uninit_options(OptionsContext *o)
  {
-@@ -3411,6 +3414,27 @@ static int open_files(OptionGroupList *l, const char *inout,
+@@ -1446,6 +1449,22 @@ static OutputStream *new_output_stream(OptionsContext *o, AVFormatContext *oc, e
+         st->id = o->streamid_map[oc->nb_streams - 1];
+ 
+     GROW_ARRAY(output_streams, nb_output_streams);
++
++    if (type == AVMEDIA_TYPE_VIDEO)
++    {
++        int is_yadiff = 0;
++        for (int i = 0; i < nb_filtergraphs; i++)
++            if (filtergraphs[i]->graph_desc)
++            {
++                is_yadiff = (strstr(filtergraphs[i]->graph_desc, "yadif=1") != NULL ? 1 : 0);
++                break;
++            }
++        if (is_yadiff)
++            nb_output_video_streams+=2;
++        else
++            nb_output_video_streams++;
++    }
++
+     if (!(ost = av_mallocz(sizeof(*ost))))
+         exit_program(1);
+     output_streams[nb_output_streams - 1] = ost;
+@@ -3411,6 +3430,27 @@ static int open_files(OptionGroupList *l, const char *inout,
          init_options(&o);
          o.g = g;
  
@@ -152,7 +209,7 @@ index 9c820ab73f..743f9aad90 100644
          ret = parse_optgroup(&o, g);
          if (ret < 0) {
              av_log(NULL, AV_LOG_ERROR, "Error parsing options for %s file "
-@@ -3793,6 +3817,12 @@ const OptionDef options[] = {
+@@ -3793,6 +3833,12 @@ const OptionDef options[] = {
      { "autoscale",        HAS_ARG | OPT_BOOL | OPT_SPEC |
                            OPT_EXPERT | OPT_OUTPUT,                               { .off = OFFSET(autoscale) },
          "automatically insert a scale filter at the end of the filter graph" },
@@ -440,23 +497,24 @@ index 3f1ab72e38..09230f270d 100644
  
  /**
 diff --git a/libavcodec/h264_slice.c b/libavcodec/h264_slice.c
-index c21004df97..593db25dcc 100644
+index c21004df97..f6640ef7c8 100644
 --- a/libavcodec/h264_slice.c
 +++ b/libavcodec/h264_slice.c
-@@ -244,6 +244,12 @@ static int alloc_picture(H264Context *h, H264Picture *pic)
+@@ -244,6 +244,13 @@ static int alloc_picture(H264Context *h, H264Picture *pic)
      pic->mb_type      = (uint32_t*)pic->mb_type_buf->data + 2 * h->mb_stride + 1;
      pic->qscale_table = pic->qscale_table_buf->data + 2 * h->mb_stride + 1;
  
 +    if( h->avctx->i_use_remv||h->avctx->i_jnd_decqp )
 +    {
 +        pic->f->myFrame = (FrameReuse*)malloc(sizeof(FrameReuse));
++        pic->f->myFrame->output_stream_drop_count = 0;
 +        pic->f->myFrame->is_dup_frame = 0;
 +    }
 +
      for (i = 0; i < 2; i++) {
          pic->motion_val_buf[i] = av_buffer_pool_get(h->motion_val_pool);
          pic->ref_index_buf[i]  = av_buffer_pool_get(h->ref_index_pool);
-@@ -526,6 +532,7 @@ static int h264_frame_start(H264Context *h)
+@@ -526,6 +533,7 @@ static int h264_frame_start(H264Context *h)
      pic->f->crop_right  = h->crop_right;
      pic->f->crop_top    = h->crop_top;
      pic->f->crop_bottom = h->crop_bottom;
@@ -465,7 +523,7 @@ index c21004df97..593db25dcc 100644
      pic->needs_fg = h->sei.film_grain_characteristics.present && !h->avctx->hwaccel &&
          !(h->avctx->export_side_data & AV_CODEC_EXPORT_DATA_FILM_GRAIN);
 diff --git a/libavcodec/h264dec.c b/libavcodec/h264dec.c
-index 6a5bf51f5d..310487d830 100644
+index 6a5bf51f5d..dabc43f5cb 100644
 --- a/libavcodec/h264dec.c
 +++ b/libavcodec/h264dec.c
 @@ -34,7 +34,6 @@
@@ -483,8 +541,8 @@ index 6a5bf51f5d..310487d830 100644
 +        if (h->avctx->i_use_remv || h->avctx->i_jnd_decqp) {
 +
 +            H264ParamSets *ps                  = &(((H264Context*)(h->avctx)->priv_data)->ps);
-+            SPS *sps                           = (SPS*)(ps->sps_list[ps->sps_id]->data);
-+            PPS *pps                           = (PPS*)(ps->pps_list[ps->pps_id]->data);
++            SPS *sps                           = (SPS*)(ps->sps_list[ps->sps->sps_id]->data);
++            PPS *pps                           = (PPS*)(ps->pps_list[ps->sps->sps_id]->data);
 +            dst->myFrame->i_frame              = h->avctx->i_input_number - h->avctx->has_b_frames;
 +            dst->myFrame->num_reorder_frames   = (h->avctx->has_b_frames>0)?1:0;
 +            dst->myFrame->ref_max              = sps->ref_frame_count;
@@ -534,16 +592,17 @@ index 87c4e4e539..838e665c1f 100644
  
  typedef struct H264Ref {
 diff --git a/libavcodec/hevc_refs.c b/libavcodec/hevc_refs.c
-index 06e42d9c53..019586dc7e 100644
+index 06e42d9c53..5a834587c5 100644
 --- a/libavcodec/hevc_refs.c
 +++ b/libavcodec/hevc_refs.c
-@@ -98,6 +98,12 @@ static HEVCFrame *alloc_frame(HEVCContext *s)
+@@ -98,6 +98,13 @@ static HEVCFrame *alloc_frame(HEVCContext *s)
          if (!frame->rpl_buf)
              goto fail;
  
 +        if( s->avctx->i_use_remv||s->avctx->i_jnd_decqp )
 +        {
 +            frame->frame->myFrame = (FrameReuse*)malloc(sizeof(FrameReuse));
++            frame->frame->myFrame->output_stream_drop_count = 0;
 +            frame->frame->myFrame->is_dup_frame = 0;
 +        }
 +
@@ -635,7 +694,7 @@ index 8d7a4f7147..384b07da3e 100644
      }
  
 diff --git a/libavcodec/libx264.c b/libavcodec/libx264.c
-index c5e0231b12..87ff22bf6e 100644
+index c5e0231b12..7dd770fd41 100644
 --- a/libavcodec/libx264.c
 +++ b/libavcodec/libx264.c
 @@ -345,6 +345,7 @@ static int X264_frame(AVCodecContext *ctx, AVPacket *pkt, const AVFrame *frame,
@@ -646,14 +705,17 @@ index c5e0231b12..87ff22bf6e 100644
  
          x4->reordered_opaque[x4->next_reordered_opaque].reordered_opaque = frame->reordered_opaque;
          x4->reordered_opaque[x4->next_reordered_opaque].wallclock = wallclock;
-@@ -974,6 +975,14 @@ static av_cold int X264_init(AVCodecContext *avctx)
+@@ -974,6 +975,17 @@ static av_cold int X264_init(AVCodecContext *avctx)
  
      avctx->bit_rate = x4->params.rc.i_bitrate*1000LL;
  
-+    if( avctx->i_use_remv && detect_avx512() )
++    if( avctx->i_use_remv && detect_mvreuse() )
 +    {
-+        x264_param_default_preset_mvreuse(&x4->params, avctx->i_use_remv, avctx->i_jnd_decqp,
-+            avctx->myFrame->framerate, avctx->myFrame->num_reorder_frames, avctx->i_use_remv_fref, avctx->myFrame->ref_max, avctx->myFrame->weighted_pred, avctx->gop_size, X264_KEYINT_MAX_INFINITE, avctx->myFrame->in_width, avctx->myFrame->in_height);
++        if( avctx->myFrame != NULL )
++            x264_param_default_preset_mvreuse(&x4->params, avctx->i_use_remv, avctx->i_jnd_decqp,
++                avctx->myFrame->framerate, avctx->myFrame->num_reorder_frames, avctx->i_use_remv_fref, avctx->myFrame->ref_max, avctx->myFrame->weighted_pred, avctx->gop_size, X264_KEYINT_MAX_INFINITE, avctx->myFrame->in_width, avctx->myFrame->in_height);
++        if( avctx->myFrame == NULL && avctx->i_use_remv == 4 )
++            x264_param_default_preset_mvreuse4(&x4->params, avctx->i_jnd_decqp);
 +    }
 +    else
 +        x4->params.i_use_remv = 0;
@@ -714,10 +776,10 @@ index 8997c85e35..1f83e104bb 100644
      av_dict_copy(&dst->metadata, src->metadata, 0);
  
 diff --git a/libavutil/frame.h b/libavutil/frame.h
-index 18e239f870..f524a25b43 100644
+index 18e239f870..ebf7573901 100644
 --- a/libavutil/frame.h
 +++ b/libavutil/frame.h
-@@ -213,6 +213,54 @@ enum AVActiveFormatDescription {
+@@ -213,6 +213,57 @@ enum AVActiveFormatDescription {
      AV_AFD_SP_4_3       = 15,
  };
  
@@ -765,6 +827,9 @@ index 18e239f870..f524a25b43 100644
 +    int is_dup_frame;
 +    int framerate;
 +    float i_frame_avg_qp_aq;
++    int output_stream_count;
++    int output_stream_drop_count;
++    int output_stream_num;
 +    MVReuse myMb[300][300];
 +    MVReuse myMb_resize[300][300];
 +} FrameReuse;
@@ -772,7 +837,7 @@ index 18e239f870..f524a25b43 100644
  
  /**
   * Structure to hold side data for an AVFrame.
-@@ -681,6 +729,15 @@ typedef struct AVFrame {
+@@ -681,6 +732,15 @@ typedef struct AVFrame {
       * for the target frame's private_ref field.
       */
      AVBufferRef *private_ref;
