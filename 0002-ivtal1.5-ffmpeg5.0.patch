@@ -1,0 +1,2094 @@
+From efbc73f88a8b9ccc47deddd2479be768981a0a7d Mon Sep 17 00:00:00 2001
+From: sstate0818 <jie.tian@intel.com>
+Date: Thu, 9 Nov 2023 13:16:49 +0800
+Subject: [PATCH] IVTAL ffmpeg5.0 release/1.5
+
+---
+ configure                              |   5 +-
+ fftools/ffmpeg.c                       |   4 +-
+ libavcodec/libx264.c                   |   9 +-
+ libavfilter/dnn/dnn_backend_openvino.c | 935 ++++++++++++++++++++-----
+ libavfilter/dnn/dnn_backend_openvino.h |   4 +-
+ libavfilter/dnn/dnn_io_proc.c          | 269 +++++--
+ libavfilter/dnn/dnn_io_proc.h          |   8 +-
+ libavfilter/dnn_interface.h            |  19 +-
+ 8 files changed, 1034 insertions(+), 219 deletions(-)
+
+diff --git a/configure b/configure
+index b2fd26e710..545a428f69 100755
+--- a/configure
++++ b/configure
+@@ -2412,6 +2412,7 @@ HAVE_LIST="
+     texi2html
+     xmllint
+     zlib_gzip
++    openvino2
+ "
+ 
+ # options emitted with CONFIG_ prefix but not available on the command line
+@@ -6585,7 +6586,9 @@ enabled libopenh264       && require_pkg_config libopenh264 openh264 wels/codec_
+ enabled libopenjpeg       && { check_pkg_config libopenjpeg "libopenjp2 >= 2.1.0" openjpeg.h opj_version ||
+                                { require_pkg_config libopenjpeg "libopenjp2 >= 2.1.0" openjpeg.h opj_version -DOPJ_STATIC && add_cppflags -DOPJ_STATIC; } }
+ enabled libopenmpt        && require_pkg_config libopenmpt "libopenmpt >= 0.2.6557" libopenmpt/libopenmpt.h openmpt_module_create -lstdc++ && append libopenmpt_extralibs "-lstdc++"
+-enabled libopenvino       && require libopenvino c_api/ie_c_api.h ie_c_api_version -linference_engine_c_api
++enabled libopenvino       && { { check_pkg_config libopenvino openvino openvino/c/openvino.h ov_core_create && enable openvino2; } ||
++                                { check_pkg_config libopenvino openvino c_api/ie_c_api.h ie_c_api_version ||
++                                  require libopenvino c_api/ie_c_api.h ie_c_api_version -linference_engine_c_api; } }
+ enabled libopus           && {
+     enabled libopus_decoder && {
+         require_pkg_config libopus opus opus_multistream.h opus_multistream_decoder_create
+diff --git a/fftools/ffmpeg.c b/fftools/ffmpeg.c
+index 32e4d50dc8..34baa3fc88 100644
+--- a/fftools/ffmpeg.c
++++ b/fftools/ffmpeg.c
+@@ -1285,7 +1285,7 @@ static void do_video_out(OutputFile *of,
+ 
+         if (i < nb0_frames && ost->last_frame->buf[0]) {
+             in_picture = ost->last_frame;
+-            if( enc->i_use_remv||enc->i_jnd_decqp )
++            if(( in_picture->myFrame != NULL ) && ( enc->i_use_remv||enc->i_jnd_decqp ))
+             {
+                 if( in_picture->myFrame->is_dup_frame == 0 )
+                     dup_frame_mode = in_picture->myFrame->num_reorder_frames > 0;
+@@ -1305,7 +1305,7 @@ static void do_video_out(OutputFile *of,
+         {
+             in_picture = next_picture;
+ 
+-            if( enc->i_use_remv||enc->i_jnd_decqp )
++            if(( in_picture->myFrame != NULL ) && ( enc->i_use_remv||enc->i_jnd_decqp ))
+             {
+                 if(next_duplicate++)
+                 {
+diff --git a/libavcodec/libx264.c b/libavcodec/libx264.c
+index 87ff22bf6e..7dd770fd41 100644
+--- a/libavcodec/libx264.c
++++ b/libavcodec/libx264.c
+@@ -975,10 +975,13 @@ static av_cold int X264_init(AVCodecContext *avctx)
+ 
+     avctx->bit_rate = x4->params.rc.i_bitrate*1000LL;
+ 
+-    if( avctx->i_use_remv && detect_avx512() )
++    if( avctx->i_use_remv && detect_mvreuse() )
+     {
+-        x264_param_default_preset_mvreuse(&x4->params, avctx->i_use_remv, avctx->i_jnd_decqp,
+-            avctx->myFrame->framerate, avctx->myFrame->num_reorder_frames, avctx->i_use_remv_fref, avctx->myFrame->ref_max, avctx->myFrame->weighted_pred, avctx->gop_size, X264_KEYINT_MAX_INFINITE, avctx->myFrame->in_width, avctx->myFrame->in_height);
++        if( avctx->myFrame != NULL )
++            x264_param_default_preset_mvreuse(&x4->params, avctx->i_use_remv, avctx->i_jnd_decqp,
++                avctx->myFrame->framerate, avctx->myFrame->num_reorder_frames, avctx->i_use_remv_fref, avctx->myFrame->ref_max, avctx->myFrame->weighted_pred, avctx->gop_size, X264_KEYINT_MAX_INFINITE, avctx->myFrame->in_width, avctx->myFrame->in_height);
++        if( avctx->myFrame == NULL && avctx->i_use_remv == 4 )
++            x264_param_default_preset_mvreuse4(&x4->params, avctx->i_jnd_decqp);
+     }
+     else
+         x4->params.i_use_remv = 0;
+diff --git a/libavfilter/dnn/dnn_backend_openvino.c b/libavfilter/dnn/dnn_backend_openvino.c
+index f5b1454d21..5d4200ede4 100644
+--- a/libavfilter/dnn/dnn_backend_openvino.c
++++ b/libavfilter/dnn/dnn_backend_openvino.c
+@@ -33,7 +33,11 @@
+ #include "libavutil/detection_bbox.h"
+ #include "../internal.h"
+ #include "safe_queue.h"
++#if HAVE_OPENVINO2
++#include <openvino/c/openvino.h>
++#else
+ #include <c_api/ie_c_api.h>
++#endif
+ #include "dnn_backend_common.h"
+ 
+ typedef struct OVOptions{
+@@ -42,6 +46,12 @@ typedef struct OVOptions{
+     uint8_t async;
+     int batch_size;
+     int input_resizable;
++    DNNLayout layout;
++    float scale;
++    float mean;
++    char *threads;
++    char *nstreams;
++    char *pinning;
+ } OVOptions;
+ 
+ typedef struct OVContext {
+@@ -52,9 +62,22 @@ typedef struct OVContext {
+ typedef struct OVModel{
+     OVContext ctx;
+     DNNModel *model;
++#if HAVE_OPENVINO2
++    ov_core_t *core;
++    ov_model_t *ov_model;
++    ov_compiled_model_t *compiled_model;
++    ov_output_const_port_t* input_port;
++    ov_preprocess_input_info_t* input_info;
++    ov_output_const_port_t* output_port;
++    ov_preprocess_output_info_t* output_info;
++    ov_preprocess_prepostprocessor_t* preprocess;
++#else
+     ie_core_t *core;
+     ie_network_t *network;
+     ie_executable_network_t *exe_network;
++    const char *all_input_names;
++    const char *all_output_names;
++#endif
+     SafeQueue *request_queue;   // holds OVRequestItem
+     Queue *task_queue;          // holds TaskItem
+     Queue *lltask_queue;     // holds LastLevelTaskItem
+@@ -62,10 +85,16 @@ typedef struct OVModel{
+ 
+ // one request for one call to openvino
+ typedef struct OVRequestItem {
+-    ie_infer_request_t *infer_request;
+     LastLevelTaskItem **lltasks;
+     uint32_t lltask_count;
++    void *input_data_buffer;
++#if HAVE_OPENVINO2
++    ov_infer_request_t *infer_request;
++    ov_callback_t callback;
++#else
+     ie_complete_call_back_t callback;
++    ie_infer_request_t *infer_request;
++#endif
+ } OVRequestItem;
+ 
+ #define APPEND_STRING(generated_string, iterate_string)                                            \
+@@ -76,19 +105,78 @@ typedef struct OVRequestItem {
+ #define FLAGS AV_OPT_FLAG_FILTERING_PARAM
+ static const AVOption dnn_openvino_options[] = {
+     { "device", "device to run model", OFFSET(options.device_type), AV_OPT_TYPE_STRING, { .str = "CPU" }, 0, 0, FLAGS },
++    { "threads", "num of threads", OFFSET(options.threads), AV_OPT_TYPE_STRING, { .str = "UNSPECIFIED" }, 0, 0, FLAGS },
++    { "nstreams", "num of nstreams", OFFSET(options.nstreams), AV_OPT_TYPE_STRING, { .str = "UNSPECIFIED" }, 0, 0, FLAGS },
++    { "pinning", "whether pinning", OFFSET(options.pinning), AV_OPT_TYPE_STRING, { .str = "UNSPECIFIED" }, 0, 0, FLAGS },
+     DNN_BACKEND_COMMON_OPTIONS
+     { "batch_size",  "batch size per request", OFFSET(options.batch_size),  AV_OPT_TYPE_INT,    { .i64 = 1 },     1, 1000, FLAGS},
+     { "input_resizable", "can input be resizable or not", OFFSET(options.input_resizable), AV_OPT_TYPE_BOOL,   { .i64 = 0 },     0, 1, FLAGS },
++    { "layout", "input layout of model", OFFSET(options.layout), AV_OPT_TYPE_INT, { .i64 = DL_NONE}, DL_NONE, DL_NHWC, FLAGS, "layout" },
++        { "none",  "none", 0, AV_OPT_TYPE_CONST, { .i64 = DL_NONE }, 0, 0, FLAGS, "layout"},
++        { "nchw",  "nchw", 0, AV_OPT_TYPE_CONST, { .i64 = DL_NCHW }, 0, 0, FLAGS, "layout"},
++        { "nhwc",  "nhwc", 0, AV_OPT_TYPE_CONST, { .i64 = DL_NHWC }, 0, 0, FLAGS, "layout"},
++    { "scale", "Add scale preprocess operation. Divide each element of input by specified value.", OFFSET(options.scale), AV_OPT_TYPE_FLOAT, { .dbl = 0 }, INT_MIN, INT_MAX, FLAGS},
++    { "mean",  "Add mean preprocess operation. Subtract specified value from each element of input.", OFFSET(options.mean),  AV_OPT_TYPE_FLOAT, { .dbl = 0 }, INT_MIN, INT_MAX, FLAGS},
+     { NULL }
+ };
+ 
+ AVFILTER_DEFINE_CLASS(dnn_openvino);
+ 
++#if HAVE_OPENVINO2
++static const struct {
++    ov_status_e status;
++    int         av_err;
++    const char *desc;
++} ov2_errors[] = {
++    { OK,                     0,                  "success"                },
++    { GENERAL_ERROR,          AVERROR_EXTERNAL,   "general error"          },
++    { NOT_IMPLEMENTED,        AVERROR(ENOSYS),    "not implemented"        },
++    { NETWORK_NOT_LOADED,     AVERROR_EXTERNAL,   "network not loaded"     },
++    { PARAMETER_MISMATCH,     AVERROR(EINVAL),    "parameter mismatch"     },
++    { NOT_FOUND,              AVERROR_EXTERNAL,   "not found"              },
++    { OUT_OF_BOUNDS,          AVERROR(EOVERFLOW), "out of bounds"          },
++    { UNEXPECTED,             AVERROR_EXTERNAL,   "unexpected"             },
++    { REQUEST_BUSY,           AVERROR(EBUSY),     "request busy"           },
++    { RESULT_NOT_READY,       AVERROR(EBUSY),     "result not ready"       },
++    { NOT_ALLOCATED,          AVERROR(ENODATA),   "not allocated"          },
++    { INFER_NOT_STARTED,      AVERROR_EXTERNAL,   "infer not started"      },
++    { NETWORK_NOT_READ,       AVERROR_EXTERNAL,   "network not read"       },
++    { INFER_CANCELLED,        AVERROR(ECANCELED), "infer cancelled"        },
++    { INVALID_C_PARAM,        AVERROR(EINVAL),    "invalid C parameter"    },
++    { UNKNOWN_C_ERROR,        AVERROR_UNKNOWN,    "unknown C error"        },
++    { NOT_IMPLEMENT_C_METHOD, AVERROR(ENOSYS),    "not implement C method" },
++    { UNKNOW_EXCEPTION,       AVERROR_UNKNOWN,    "unknown exception"      },
++};
++
++static int ov2_map_error(ov_status_e status, const char **desc)
++{
++    int i;
++    for (i = 0; i < FF_ARRAY_ELEMS(ov2_errors); i++) {
++        if (ov2_errors[i].status == status) {
++            if (desc)
++                *desc = ov2_errors[i].desc;
++            return ov2_errors[i].av_err;
++        }
++    }
++    if (desc)
++        *desc = "unknown error";
++    return AVERROR_UNKNOWN;
++}
++#endif
++
++#if HAVE_OPENVINO2
++static DNNDataType precision_to_datatype(ov_element_type_e precision)
++#else
+ static DNNDataType precision_to_datatype(precision_e precision)
++#endif
+ {
+     switch (precision)
+     {
++#if HAVE_OPENVINO2
++    case F32:
++#else
+     case FP32:
++#endif
+         return DNN_FLOAT;
+     case U8:
+         return DNN_UINT8;
+@@ -112,26 +200,75 @@ static int get_datatype_size(DNNDataType dt)
+     }
+ }
+ 
+-static DNNReturnType fill_model_input_ov(OVModel *ov_model, OVRequestItem *request)
++static int fill_model_input_ov(OVModel *ov_model, OVRequestItem *request)
+ {
++    DNNData input;
++    LastLevelTaskItem *lltask;
++    TaskItem *task;
++    OVContext *ctx = &ov_model->ctx;
++#if HAVE_OPENVINO2
++    int64_t* dims;
++    ov_status_e status;
++    ov_tensor_t* tensor = NULL;
++    ov_shape_t input_shape = {0};
++    ov_element_type_e precision;
++#else
+     dimensions_t dims;
+     precision_e precision;
+     ie_blob_buffer_t blob_buffer;
+-    OVContext *ctx = &ov_model->ctx;
+     IEStatusCode status;
+-    DNNData input;
+     ie_blob_t *input_blob = NULL;
+-    LastLevelTaskItem *lltask;
+-    TaskItem *task;
++#endif
+ 
++    memset(&input, 0, sizeof(input));
+     lltask = ff_queue_peek_front(ov_model->lltask_queue);
+     av_assert0(lltask);
+     task = lltask->task;
+ 
++#if HAVE_OPENVINO2
++    if (!ov_model_is_dynamic(ov_model->ov_model)) {
++        if (ov_model->input_port) {
++            ov_output_const_port_free(ov_model->input_port);
++            ov_model->input_port = NULL;
++        }
++        status = ov_model_const_input_by_name(ov_model->ov_model, task->input_name, &ov_model->input_port);
++        if (status != OK) {
++            av_log(ctx, AV_LOG_ERROR, "Failed to get input port shape.\n");
++            return ov2_map_error(status, NULL);
++        }
++        status = ov_const_port_get_shape(ov_model->input_port, &input_shape);
++        if (status != OK) {
++            av_log(ctx, AV_LOG_ERROR, "Failed to get input port shape.\n");
++            return ov2_map_error(status, NULL);
++        }
++        dims = input_shape.dims;
++        status = ov_port_get_element_type(ov_model->input_port, &precision);
++        if (status != OK) {
++            av_log(ctx, AV_LOG_ERROR, "Failed to get input port data type.\n");
++            ov_shape_free(&input_shape);
++            return ov2_map_error(status, NULL);
++        }
++    } else {
++        avpriv_report_missing_feature(ctx, "Do not support dynamic model.");
++        return AVERROR(ENOSYS);
++    }
++    input.height = dims[1];
++    input.width = dims[2];
++    input.channels = dims[3];
++    input.dt = precision_to_datatype(precision);
++    if (!request->input_data_buffer) {
++        request->input_data_buffer = av_malloc(input.height * input.width * input.channels * get_datatype_size(input.dt));
++        if (!request->input_data_buffer) {
++            ov_shape_free(&input_shape);
++            return AVERROR(ENOMEM);
++        }
++    }
++    input.data = request->input_data_buffer;
++#else
+     status = ie_infer_request_get_blob(request->infer_request, task->input_name, &input_blob);
+     if (status != OK) {
+         av_log(ctx, AV_LOG_ERROR, "Failed to get input blob with name %s\n", task->input_name);
+-        return DNN_ERROR;
++        return DNN_GENERIC_ERROR;
+     }
+ 
+     status |= ie_blob_get_dims(input_blob, &dims);
+@@ -139,24 +276,27 @@ static DNNReturnType fill_model_input_ov(OVModel *ov_model, OVRequestItem *reque
+     if (status != OK) {
+         ie_blob_free(&input_blob);
+         av_log(ctx, AV_LOG_ERROR, "Failed to get input blob dims/precision\n");
+-        return DNN_ERROR;
++        return DNN_GENERIC_ERROR;
+     }
+ 
+     status = ie_blob_get_buffer(input_blob, &blob_buffer);
+     if (status != OK) {
+         ie_blob_free(&input_blob);
+         av_log(ctx, AV_LOG_ERROR, "Failed to get input blob buffer\n");
+-        return DNN_ERROR;
++        return DNN_GENERIC_ERROR;
+     }
+-
+     input.height = dims.dims[2];
+     input.width = dims.dims[3];
+     input.channels = dims.dims[1];
+     input.data = blob_buffer.buffer;
+     input.dt = precision_to_datatype(precision);
++#endif
+     // all models in openvino open model zoo use BGR as input,
+     // change to be an option when necessary.
+     input.order = DCO_BGR;
++    // We use preprocess_steps to scale input data, so disable scale and mean here.
++    input.scale = 1;
++    input.mean = 0;
+ 
+     for (int i = 0; i < ctx->options.batch_size; ++i) {
+         lltask = ff_queue_pop_front(ov_model->lltask_queue);
+@@ -186,44 +326,89 @@ static DNNReturnType fill_model_input_ov(OVModel *ov_model, OVRequestItem *reque
+             av_assert0(!"should not reach here");
+             break;
+         }
++#if HAVE_OPENVINO2
++        status = ov_tensor_create_from_host_ptr(precision, input_shape, input.data, &tensor);
++        ov_shape_free(&input_shape);
++        if (status != OK) {
++            av_log(ctx, AV_LOG_ERROR, "Failed to create tensor from host prt.\n");
++            return ov2_map_error(status, NULL);
++        }
++        status = ov_infer_request_set_input_tensor(request->infer_request, tensor);
++        if (status != OK) {
++            av_log(ctx, AV_LOG_ERROR, "Failed to Set an input tensor for the model.\n");
++            return ov2_map_error(status, NULL);
++        }
++#endif
+         input.data = (uint8_t *)input.data
+                      + input.width * input.height * input.channels * get_datatype_size(input.dt);
+     }
++#if !HAVE_OPENVINO2
+     ie_blob_free(&input_blob);
++#endif
+ 
+-    return DNN_SUCCESS;
++    return 0;
+ }
+ 
+ static void infer_completion_callback(void *args)
+ {
+-    dimensions_t dims;
+-    precision_e precision;
+-    IEStatusCode status;
+     OVRequestItem *request = args;
+     LastLevelTaskItem *lltask = request->lltasks[0];
+     TaskItem *task = lltask->task;
+     OVModel *ov_model = task->model;
+     SafeQueue *requestq = ov_model->request_queue;
+-    ie_blob_t *output_blob = NULL;
+-    ie_blob_buffer_t blob_buffer;
+     DNNData output;
+     OVContext *ctx = &ov_model->ctx;
++#if HAVE_OPENVINO2
++    size_t* dims;
++    ov_status_e status;
++    ov_tensor_t *output_tensor;
++    ov_shape_t output_shape = {0};
++    ov_element_type_e precision;
++
++    memset(&output, 0, sizeof(output));
++    status = ov_infer_request_get_output_tensor_by_index(request->infer_request, 0, &output_tensor);
++    if (status != OK) {
++        av_log(ctx, AV_LOG_ERROR,
++               "Failed to get output tensor.");
++        return;
++    }
++
++    status = ov_tensor_data(output_tensor, &output.data);
++    if (status != OK) {
++        av_log(ctx, AV_LOG_ERROR,
++               "Failed to get output data.");
++        return;
++    }
++
++    status = ov_tensor_get_shape(output_tensor, &output_shape);
++    if (status != OK) {
++        av_log(ctx, AV_LOG_ERROR, "Failed to get output port shape.\n");
++        return;
++    }
++    dims = output_shape.dims;
+ 
++    status = ov_port_get_element_type(ov_model->output_port, &precision);
++    if (status != OK) {
++        av_log(ctx, AV_LOG_ERROR, "Failed to get output port data type.\n");
++        ov_shape_free(&output_shape);
++        return;
++    }
++    output.channels = dims[1];
++    output.height   = dims[2];
++    output.width    = dims[3];
++    av_assert0(request->lltask_count <= dims[0]);
++    ov_shape_free(&output_shape);
++#else
++    IEStatusCode status;
++    dimensions_t dims;
++    ie_blob_t *output_blob = NULL;
++    ie_blob_buffer_t blob_buffer;
++    precision_e precision;
+     status = ie_infer_request_get_blob(request->infer_request, task->output_names[0], &output_blob);
+     if (status != OK) {
+-        //incorrect output name
+-        char *model_output_name = NULL;
+-        char *all_output_names = NULL;
+-        size_t model_output_count = 0;
+-        av_log(ctx, AV_LOG_ERROR, "Failed to get model output data\n");
+-        status = ie_network_get_outputs_number(ov_model->network, &model_output_count);
+-        for (size_t i = 0; i < model_output_count; i++) {
+-            status = ie_network_get_output_name(ov_model->network, i, &model_output_name);
+-            APPEND_STRING(all_output_names, model_output_name)
+-        }
+         av_log(ctx, AV_LOG_ERROR,
+                "output \"%s\" may not correct, all output(s) are: \"%s\"\n",
+-               task->output_names[0], all_output_names);
++               task->output_names[0], ov_model->all_output_names);
+         return;
+     }
+ 
+@@ -241,18 +426,20 @@ static void infer_completion_callback(void *args)
+         av_log(ctx, AV_LOG_ERROR, "Failed to get dims or precision of output\n");
+         return;
+     }
+-
++    output.data     = blob_buffer.buffer;
+     output.channels = dims.dims[1];
+     output.height   = dims.dims[2];
+     output.width    = dims.dims[3];
++    av_assert0(request->lltask_count <= dims.dims[0]);
++#endif
+     output.dt       = precision_to_datatype(precision);
+-    output.data     = blob_buffer.buffer;
++    output.layout   = ctx->options.layout;
++    output.scale    = ctx->options.scale;
++    output.mean     = ctx->options.mean;
+ 
+-    av_assert0(request->lltask_count <= dims.dims[0]);
+     av_assert0(request->lltask_count >= 1);
+     for (int i = 0; i < request->lltask_count; ++i) {
+         task = request->lltasks[i]->task;
+-        task->inference_done++;
+ 
+         switch (ov_model->model->func_type) {
+         case DFT_PROCESS_FRAME:
+@@ -286,57 +473,284 @@ static void infer_completion_callback(void *args)
+             break;
+         }
+ 
++        task->inference_done++;
+         av_freep(&request->lltasks[i]);
+         output.data = (uint8_t *)output.data
+                       + output.width * output.height * output.channels * get_datatype_size(output.dt);
+     }
++#if !HAVE_OPENVINO2
+     ie_blob_free(&output_blob);
+-
++#endif
+     request->lltask_count = 0;
+     if (ff_safe_queue_push_back(requestq, request) < 0) {
++#if HAVE_OPENVINO2
++        ov_infer_request_free(request->infer_request);
++#else
+         ie_infer_request_free(&request->infer_request);
++#endif
+         av_freep(&request);
+         av_log(ctx, AV_LOG_ERROR, "Failed to push back request_queue.\n");
+         return;
+     }
+ }
+ 
+-static DNNReturnType init_model_ov(OVModel *ov_model, const char *input_name, const char *output_name)
++void ff_dnn_free_model_ov(DNNModel **model)
+ {
++    OVModel *ov_model;
++
++    if (!model || !*model)
++        return;
++
++    ov_model = (*model)->model;
++    while (ff_safe_queue_size(ov_model->request_queue) != 0) {
++        OVRequestItem *item = ff_safe_queue_pop_front(ov_model->request_queue);
++        if (item && item->infer_request) {
++#if HAVE_OPENVINO2
++            ov_infer_request_free(item->infer_request);
++#else
++            ie_infer_request_free(&item->infer_request);
++#endif
++        }
++        av_freep(&item->input_data_buffer);
++        av_freep(&item->lltasks);
++        av_freep(&item);
++    }
++    ff_safe_queue_destroy(ov_model->request_queue);
++
++    while (ff_queue_size(ov_model->lltask_queue) != 0) {
++        LastLevelTaskItem *item = ff_queue_pop_front(ov_model->lltask_queue);
++        av_freep(&item);
++    }
++    ff_queue_destroy(ov_model->lltask_queue);
++
++    while (ff_queue_size(ov_model->task_queue) != 0) {
++        TaskItem *item = ff_queue_pop_front(ov_model->task_queue);
++        av_frame_free(&item->in_frame);
++        av_frame_free(&item->out_frame);
++        av_freep(&item);
++    }
++    ff_queue_destroy(ov_model->task_queue);
++#if HAVE_OPENVINO2
++    if (ov_model->input_port)
++        ov_output_const_port_free(ov_model->input_port);
++    if (ov_model->output_port)
++        ov_output_const_port_free(ov_model->output_port);
++    if (ov_model->preprocess)
++        ov_preprocess_prepostprocessor_free(ov_model->preprocess);
++    if (ov_model->compiled_model)
++        ov_compiled_model_free(ov_model->compiled_model);
++    if (ov_model->ov_model)
++        ov_model_free(ov_model->ov_model);
++    if (ov_model->core)
++        ov_core_free(ov_model->core);
++#else
++    if (ov_model->exe_network)
++        ie_exec_network_free(&ov_model->exe_network);
++    if (ov_model->network)
++        ie_network_free(&ov_model->network);
++    if (ov_model->core)
++        ie_core_free(&ov_model->core);
++    av_free(ov_model->all_output_names);
++    av_free(ov_model->all_input_names);
++#endif
++    av_opt_free(&ov_model->ctx);
++    av_freep(&ov_model);
++    av_freep(model);
++}
++
++
++static int init_model_ov(OVModel *ov_model, const char *input_name, const char *output_name)
++{
++    int ret = 0;
+     OVContext *ctx = &ov_model->ctx;
++#if HAVE_OPENVINO2
++    ov_status_e status;
++    ov_preprocess_input_tensor_info_t* input_tensor_info = NULL;
++    ov_preprocess_output_tensor_info_t* output_tensor_info = NULL;
++    ov_preprocess_input_model_info_t* input_model_info = NULL;
++    ov_model_t *tmp_ov_model;
++    ov_layout_t* NHWC_layout = NULL;
++    ov_layout_t* NCHW_layout = NULL;
++    const char* NHWC_desc = "NHWC";
++    const char* NCHW_desc = "NCHW";
++    const char* device = ctx->options.device_type;
++#else
+     IEStatusCode status;
+     ie_available_devices_t a_dev;
+     ie_config_t config = {NULL, NULL, NULL};
+     char *all_dev_names = NULL;
+-
++#endif
++    // We scale pixel by default when do frame processing.
++    if (fabsf(ctx->options.scale) < 1e-6f)
++        ctx->options.scale = ov_model->model->func_type == DFT_PROCESS_FRAME ? 255 : 1;
+     // batch size
+     if (ctx->options.batch_size <= 0) {
+         ctx->options.batch_size = 1;
+     }
++#if HAVE_OPENVINO2
++    if (ctx->options.batch_size > 1) {
++        avpriv_report_missing_feature(ctx, "Do not support batch_size > 1 for now,"
++                                           "change batch_size to 1.\n");
++        ctx->options.batch_size = 1;
++    }
++
++    status = ov_preprocess_prepostprocessor_create(ov_model->ov_model, &ov_model->preprocess);
++    if (status != OK) {
++        av_log(ctx, AV_LOG_ERROR, "Failed to create preprocess for ov_model.\n");
++        ret = ov2_map_error(status, NULL);
++        goto err;
++    }
++
++    status = ov_preprocess_prepostprocessor_get_input_info_by_name(ov_model->preprocess, input_name, &ov_model->input_info);
++    status |= ov_preprocess_prepostprocessor_get_output_info_by_name(ov_model->preprocess, output_name, &ov_model->output_info);
++    if (status != OK) {
++        av_log(ctx, AV_LOG_ERROR, "Failed to get input/output info from preprocess.\n");
++        ret = ov2_map_error(status, NULL);
++        goto err;
++    }
++
++    status = ov_preprocess_input_info_get_tensor_info(ov_model->input_info, &input_tensor_info);
++    status |= ov_preprocess_output_info_get_tensor_info(ov_model->output_info, &output_tensor_info);
++    if (status != OK) {
++        av_log(ctx, AV_LOG_ERROR, "Failed to get tensor info from input/output.\n");
++        ret = ov2_map_error(status, NULL);
++        goto err;
++    }
++
++    //set input layout
++    status = ov_layout_create(NHWC_desc, &NHWC_layout);
++    status |= ov_layout_create(NCHW_desc, &NCHW_layout);
++    if (status != OK) {
++        av_log(ctx, AV_LOG_ERROR, "Failed to create layout for input.\n");
++        ret = ov2_map_error(status, NULL);
++        goto err;
++    }
++
++    status = ov_preprocess_input_tensor_info_set_layout(input_tensor_info, NHWC_layout);
++    if (status != OK) {
++        av_log(ctx, AV_LOG_ERROR, "Failed to set input tensor layout\n");
++        ret = ov2_map_error(status, NULL);
++        goto err;
++    }
++
++    status = ov_preprocess_input_info_get_model_info(ov_model->input_info, &input_model_info);
++    if (status != OK) {
++        av_log(ctx, AV_LOG_ERROR, "Failed to get input model info\n");
++        ret = ov2_map_error(status, NULL);
++        goto err;
++    }
++    if (ctx->options.layout == DL_NCHW)
++        status = ov_preprocess_input_model_info_set_layout(input_model_info, NCHW_layout);
++    else if (ctx->options.layout == DL_NHWC)
++        status = ov_preprocess_input_model_info_set_layout(input_model_info, NHWC_layout);
++    if (status != OK) {
++        av_log(ctx, AV_LOG_ERROR, "Failed to get set input model layout\n");
++        ret = ov2_map_error(status, NULL);
++        goto err;
++    }
++
++    status = ov_preprocess_input_tensor_info_set_element_type(input_tensor_info, U8);
++    if (ov_model->model->func_type != DFT_PROCESS_FRAME)
++        status |= ov_preprocess_output_set_element_type(output_tensor_info, F32);
++    else if (fabsf(ctx->options.scale - 1) > 1e-6f || fabsf(ctx->options.mean) > 1e-6f)
++        status |= ov_preprocess_output_set_element_type(output_tensor_info, F32);
++    else
++        status |= ov_preprocess_output_set_element_type(output_tensor_info, U8);
++    if (status != OK) {
++        av_log(ctx, AV_LOG_ERROR, "Failed to set input/output element type\n");
++        ret = ov2_map_error(status, NULL);
++        goto err;
++    }
++    // set preprocess steps.
++    if (fabsf(ctx->options.scale - 1) > 1e-6f || fabsf(ctx->options.mean) > 1e-6f) {
++        ov_preprocess_preprocess_steps_t* input_process_steps = NULL;
++        status = ov_preprocess_input_info_get_preprocess_steps(ov_model->input_info, &input_process_steps);
++        if (status != OK) {
++            av_log(ctx, AV_LOG_ERROR, "Failed to get preprocess steps\n");
++            ret = ov2_map_error(status, NULL);
++            goto err;
++        }
++        status = ov_preprocess_preprocess_steps_convert_element_type(input_process_steps, F32);
++        status |= ov_preprocess_preprocess_steps_mean(input_process_steps, ctx->options.mean);
++        status |= ov_preprocess_preprocess_steps_scale(input_process_steps, ctx->options.scale);
++        if (status != OK) {
++            av_log(ctx, AV_LOG_ERROR, "Failed to set preprocess steps\n");
++            ret = ov2_map_error(status, NULL);
++            goto err;
++        }
++        ov_preprocess_preprocess_steps_free(input_process_steps);
++    }
+ 
++    //update model
++    if(ov_model->ov_model)
++        tmp_ov_model = ov_model->ov_model;
++    status = ov_preprocess_prepostprocessor_build(ov_model->preprocess, &ov_model->ov_model);
++    if (status != OK) {
++        av_log(ctx, AV_LOG_ERROR, "Failed to update OV model\n");
++        ret = ov2_map_error(status, NULL);
++        goto err;
++    }
++    ov_model_free(tmp_ov_model);
++
++    //update output_port
++    if (ov_model->output_port) {
++        ov_output_const_port_free(ov_model->output_port);
++        ov_model->output_port = NULL;
++    }
++    status = ov_model_const_output_by_name(ov_model->ov_model, output_name, &ov_model->output_port);
++    if (status != OK) {
++        av_log(ctx, AV_LOG_ERROR, "Failed to get output port.\n");
++        goto err;
++    }
++    //compile network
++    status = ov_core_compile_model(ov_model->core, ov_model->ov_model, device, 0, &ov_model->compiled_model);
++    if (status != OK) {
++        ret = ov2_map_error(status, NULL);
++        goto err;
++    }
++    ov_preprocess_input_model_info_free(input_model_info);
++    ov_layout_free(NCHW_layout);
++    ov_layout_free(NHWC_layout);
++#else
+     if (ctx->options.batch_size > 1) {
+         input_shapes_t input_shapes;
+         status = ie_network_get_input_shapes(ov_model->network, &input_shapes);
+-        if (status != OK)
++        if (status != OK) {
++            ret = DNN_GENERIC_ERROR;
+             goto err;
++        }
+         for (int i = 0; i < input_shapes.shape_num; i++)
+             input_shapes.shapes[i].shape.dims[0] = ctx->options.batch_size;
+         status = ie_network_reshape(ov_model->network, input_shapes);
+         ie_network_input_shapes_free(&input_shapes);
+-        if (status != OK)
++        if (status != OK) {
++            ret = DNN_GENERIC_ERROR;
+             goto err;
++        }
+     }
+ 
+     // The order of dims in the openvino is fixed and it is always NCHW for 4-D data.
+     // while we pass NHWC data from FFmpeg to openvino
+     status = ie_network_set_input_layout(ov_model->network, input_name, NHWC);
+     if (status != OK) {
+-        av_log(ctx, AV_LOG_ERROR, "Failed to set layout as NHWC for input %s\n", input_name);
++        if (status == NOT_FOUND) {
++            av_log(ctx, AV_LOG_ERROR, "Could not find \"%s\" in model, failed to set input layout as NHWC, "\
++                                      "all input(s) are: \"%s\"\n", input_name, ov_model->all_input_names);
++        } else{
++            av_log(ctx, AV_LOG_ERROR, "Failed to set layout as NHWC for input %s\n", input_name);
++        }
++        ret = DNN_GENERIC_ERROR;
+         goto err;
+     }
+     status = ie_network_set_output_layout(ov_model->network, output_name, NHWC);
+     if (status != OK) {
+-        av_log(ctx, AV_LOG_ERROR, "Failed to set layout as NHWC for output %s\n", output_name);
++        if (status == NOT_FOUND) {
++            av_log(ctx, AV_LOG_ERROR, "Could not find \"%s\" in model, failed to set output layout as NHWC, "\
++                                      "all output(s) are: \"%s\"\n", output_name, ov_model->all_output_names);
++        } else{
++            av_log(ctx, AV_LOG_ERROR, "Failed to set layout as NHWC for output %s\n", output_name);
++        }
++        ret = DNN_GENERIC_ERROR;
+         goto err;
+     }
+ 
+@@ -350,6 +764,7 @@ static DNNReturnType init_model_ov(OVModel *ov_model, const char *input_name, co
+         status = ie_network_set_input_precision(ov_model->network, input_name, U8);
+         if (status != OK) {
+             av_log(ctx, AV_LOG_ERROR, "Failed to set input precision as U8 for %s\n", input_name);
++            ret = DNN_GENERIC_ERROR;
+             goto err;
+         }
+     }
+@@ -360,6 +775,7 @@ static DNNReturnType init_model_ov(OVModel *ov_model, const char *input_name, co
+         status = ie_core_get_available_devices(ov_model->core, &a_dev);
+         if (status != OK) {
+             av_log(ctx, AV_LOG_ERROR, "Failed to get available devices\n");
++            ret = DNN_GENERIC_ERROR;
+             goto err;
+         }
+         for (int i = 0; i < a_dev.num_devices; i++) {
+@@ -367,9 +783,10 @@ static DNNReturnType init_model_ov(OVModel *ov_model, const char *input_name, co
+         }
+         av_log(ctx, AV_LOG_ERROR,"device %s may not be supported, all available devices are: \"%s\"\n",
+                ctx->options.device_type, all_dev_names);
++        ret = AVERROR(ENODEV);
+         goto err;
+     }
+-
++#endif
+     // create infer_requests for async execution
+     if (ctx->options.nireq <= 0) {
+         // the default value is a rough estimation
+@@ -378,29 +795,46 @@ static DNNReturnType init_model_ov(OVModel *ov_model, const char *input_name, co
+ 
+     ov_model->request_queue = ff_safe_queue_create();
+     if (!ov_model->request_queue) {
++        ret = AVERROR(ENOMEM);
+         goto err;
+     }
+ 
+     for (int i = 0; i < ctx->options.nireq; i++) {
+         OVRequestItem *item = av_mallocz(sizeof(*item));
+         if (!item) {
++            ret = AVERROR(ENOMEM);
+             goto err;
+         }
+ 
++#if HAVE_OPENVINO2
++        item->callback.callback_func = infer_completion_callback;
++#else
+         item->callback.completeCallBackFunc = infer_completion_callback;
++#endif
+         item->callback.args = item;
+         if (ff_safe_queue_push_back(ov_model->request_queue, item) < 0) {
+             av_freep(&item);
++            ret = AVERROR(ENOMEM);
+             goto err;
+         }
+ 
++#if HAVE_OPENVINO2
++        status = ov_compiled_model_create_infer_request(ov_model->compiled_model, &item->infer_request);
++        if (status != OK) {
++            av_log(ctx, AV_LOG_ERROR, "Failed to Creates an inference request object.\n");
++            goto err;
++        }
++#else
+         status = ie_exec_network_create_infer_request(ov_model->exe_network, &item->infer_request);
+         if (status != OK) {
++            ret = DNN_GENERIC_ERROR;
+             goto err;
+         }
++#endif
+ 
+         item->lltasks = av_malloc_array(ctx->options.batch_size, sizeof(*item->lltasks));
+         if (!item->lltasks) {
++            ret = AVERROR(ENOMEM);
+             goto err;
+         }
+         item->lltask_count = 0;
+@@ -408,34 +842,52 @@ static DNNReturnType init_model_ov(OVModel *ov_model, const char *input_name, co
+ 
+     ov_model->task_queue = ff_queue_create();
+     if (!ov_model->task_queue) {
++        ret = AVERROR(ENOMEM);
+         goto err;
+     }
+ 
+     ov_model->lltask_queue = ff_queue_create();
+     if (!ov_model->lltask_queue) {
++        ret = AVERROR(ENOMEM);
+         goto err;
+     }
+ 
+-    return DNN_SUCCESS;
++    return 0;
+ 
+ err:
++#if HAVE_OPENVINO2
++    if (NCHW_layout)
++        ov_layout_free(NCHW_layout);
++    if (NHWC_layout)
++        ov_layout_free(NHWC_layout);
++    if (input_model_info)
++        ov_preprocess_input_model_info_free(input_model_info);
++#endif
+     ff_dnn_free_model_ov(&ov_model->model);
+-    return DNN_ERROR;
++    return ret;
+ }
+ 
+-static DNNReturnType execute_model_ov(OVRequestItem *request, Queue *inferenceq)
++static int execute_model_ov(OVRequestItem *request, Queue *inferenceq)
+ {
++#if HAVE_OPENVINO2
++    ov_status_e status;
++#else
+     IEStatusCode status;
+-    DNNReturnType ret;
++#endif
+     LastLevelTaskItem *lltask;
++    int ret = 0;
+     TaskItem *task;
+     OVContext *ctx;
+     OVModel *ov_model;
+ 
+     if (ff_queue_size(inferenceq) == 0) {
++#if HAVE_OPENVINO2
++        ov_infer_request_free(request->infer_request);
++#else
+         ie_infer_request_free(&request->infer_request);
++#endif
+         av_freep(&request);
+-        return DNN_SUCCESS;
++        return 0;
+     }
+ 
+     lltask = ff_queue_peek_front(inferenceq);
+@@ -443,66 +895,132 @@ static DNNReturnType execute_model_ov(OVRequestItem *request, Queue *inferenceq)
+     ov_model = task->model;
+     ctx = &ov_model->ctx;
+ 
++    ret = fill_model_input_ov(ov_model, request);
++    if (ret != 0) {
++        goto err;
++    }
++
++#if HAVE_OPENVINO2
+     if (task->async) {
+-        ret = fill_model_input_ov(ov_model, request);
+-        if (ret != DNN_SUCCESS) {
++        status = ov_infer_request_set_callback(request->infer_request, &request->callback);
++        if (status != OK) {
++            av_log(ctx, AV_LOG_ERROR, "Failed to set completion callback for inference\n");
++            ret = ov2_map_error(status, NULL);
+             goto err;
+         }
++
++        status = ov_infer_request_start_async(request->infer_request);
++        if (status != OK) {
++            av_log(ctx, AV_LOG_ERROR, "Failed to start async inference\n");
++            ret = ov2_map_error(status, NULL);
++            goto err;
++        }
++        return 0;
++    } else {
++        status = ov_infer_request_infer(request->infer_request);
++        if (status != OK) {
++            av_log(NULL, AV_LOG_ERROR, "Failed to start synchronous model inference for OV2\n");
++            ret = ov2_map_error(status, NULL);
++            goto err;
++        }
++        infer_completion_callback(request);
++        return (task->inference_done == task->inference_todo) ? 0 : DNN_GENERIC_ERROR;
++    }
++#else
++    if (task->async) {
+         status = ie_infer_set_completion_callback(request->infer_request, &request->callback);
+         if (status != OK) {
+             av_log(ctx, AV_LOG_ERROR, "Failed to set completion callback for inference\n");
++            ret = DNN_GENERIC_ERROR;
+             goto err;
+         }
+         status = ie_infer_request_infer_async(request->infer_request);
+         if (status != OK) {
+             av_log(ctx, AV_LOG_ERROR, "Failed to start async inference\n");
++            ret = DNN_GENERIC_ERROR;
+             goto err;
+         }
+-        return DNN_SUCCESS;
++        return 0;
+     } else {
+-        ret = fill_model_input_ov(ov_model, request);
+-        if (ret != DNN_SUCCESS) {
+-            goto err;
+-        }
+         status = ie_infer_request_infer(request->infer_request);
+         if (status != OK) {
+             av_log(ctx, AV_LOG_ERROR, "Failed to start synchronous model inference\n");
++            ret = DNN_GENERIC_ERROR;
+             goto err;
+         }
+         infer_completion_callback(request);
+-        return (task->inference_done == task->inference_todo) ? DNN_SUCCESS : DNN_ERROR;
++        return (task->inference_done == task->inference_todo) ? 0 : DNN_GENERIC_ERROR;
+     }
++#endif
+ err:
+     if (ff_safe_queue_push_back(ov_model->request_queue, request) < 0) {
++#if HAVE_OPENVINO2
++        ov_infer_request_free(request->infer_request);
++#else
+         ie_infer_request_free(&request->infer_request);
++#endif
+         av_freep(&request);
+     }
+-    return DNN_ERROR;
++    return ret;
+ }
+ 
+-static DNNReturnType get_input_ov(void *model, DNNData *input, const char *input_name)
++static int get_input_ov(void *model, DNNData *input, const char *input_name)
+ {
+     OVModel *ov_model = model;
+     OVContext *ctx = &ov_model->ctx;
++    int input_resizable = ctx->options.input_resizable;
++
++#if HAVE_OPENVINO2
++    ov_shape_t input_shape = {0};
++    ov_element_type_e precision;
++    int64_t* dims;
++    ov_status_e status;
++    if (!ov_model_is_dynamic(ov_model->ov_model)) {
++        status = ov_model_const_input_by_name(ov_model->ov_model, input_name, &ov_model->input_port);
++        if (status != OK) {
++            av_log(ctx, AV_LOG_ERROR, "Failed to get input port shape.\n");
++            return ov2_map_error(status, NULL);
++        }
++
++        status = ov_const_port_get_shape(ov_model->input_port, &input_shape);
++        if (status != OK) {
++            av_log(ctx, AV_LOG_ERROR, "Failed to get input port shape.\n");
++            return ov2_map_error(status, NULL);
++        }
++        dims = input_shape.dims;
++
++        status = ov_port_get_element_type(ov_model->input_port, &precision);
++        if (status != OK) {
++            av_log(ctx, AV_LOG_ERROR, "Failed to get input port data type.\n");
++            return ov2_map_error(status, NULL);
++        }
++    } else {
++        avpriv_report_missing_feature(ctx, "Do not support dynamic model now.");
++        return AVERROR(ENOSYS);
++    }
++
++    input->channels = dims[1];
++    input->height   = input_resizable ? -1 : dims[2];
++    input->width    = input_resizable ? -1 : dims[3];
++    input->dt       = precision_to_datatype(precision);
++
++    return 0;
++#else
+     char *model_input_name = NULL;
+-    char *all_input_names = NULL;
+     IEStatusCode status;
+     size_t model_input_count = 0;
+     dimensions_t dims;
+     precision_e precision;
+-    int input_resizable = ctx->options.input_resizable;
+-
+     status = ie_network_get_inputs_number(ov_model->network, &model_input_count);
+     if (status != OK) {
+         av_log(ctx, AV_LOG_ERROR, "Failed to get input count\n");
+-        return DNN_ERROR;
++        return DNN_GENERIC_ERROR;
+     }
+-
+     for (size_t i = 0; i < model_input_count; i++) {
+         status = ie_network_get_input_name(ov_model->network, i, &model_input_name);
+         if (status != OK) {
+             av_log(ctx, AV_LOG_ERROR, "Failed to get No.%d input's name\n", (int)i);
+-            return DNN_ERROR;
++            return DNN_GENERIC_ERROR;
+         }
+         if (strcmp(model_input_name, input_name) == 0) {
+             ie_network_name_free(&model_input_name);
+@@ -510,24 +1028,22 @@ static DNNReturnType get_input_ov(void *model, DNNData *input, const char *input
+             status |= ie_network_get_input_precision(ov_model->network, input_name, &precision);
+             if (status != OK) {
+                 av_log(ctx, AV_LOG_ERROR, "Failed to get No.%d input's dims or precision\n", (int)i);
+-                return DNN_ERROR;
++                return DNN_GENERIC_ERROR;
+             }
+ 
+             input->channels = dims.dims[1];
+             input->height   = input_resizable ? -1 : dims.dims[2];
+             input->width    = input_resizable ? -1 : dims.dims[3];
+             input->dt       = precision_to_datatype(precision);
+-            return DNN_SUCCESS;
+-        } else {
+-            //incorrect input name
+-            APPEND_STRING(all_input_names, model_input_name)
++            return 0;
+         }
+ 
+         ie_network_name_free(&model_input_name);
+     }
+ 
+-    av_log(ctx, AV_LOG_ERROR, "Could not find \"%s\" in model, all input(s) are: \"%s\"\n", input_name, all_input_names);
+-    return DNN_ERROR;
++    av_log(ctx, AV_LOG_ERROR, "Could not find \"%s\" in model, all input(s) are: \"%s\"\n", input_name, ov_model->all_input_names);
++    return AVERROR(EINVAL);
++#endif
+ }
+ 
+ static int contain_valid_detection_bbox(AVFrame *frame)
+@@ -567,7 +1083,7 @@ static int contain_valid_detection_bbox(AVFrame *frame)
+     return 1;
+ }
+ 
+-static DNNReturnType extract_lltask_from_task(DNNFunctionType func_type, TaskItem *task, Queue *lltask_queue, DNNExecBaseParams *exec_params)
++static int extract_lltask_from_task(DNNFunctionType func_type, TaskItem *task, Queue *lltask_queue, DNNExecBaseParams *exec_params)
+ {
+     switch (func_type) {
+     case DFT_PROCESS_FRAME:
+@@ -575,16 +1091,16 @@ static DNNReturnType extract_lltask_from_task(DNNFunctionType func_type, TaskIte
+     {
+         LastLevelTaskItem *lltask = av_malloc(sizeof(*lltask));
+         if (!lltask) {
+-            return DNN_ERROR;
++            return AVERROR(ENOMEM);
+         }
+         task->inference_todo = 1;
+         task->inference_done = 0;
+         lltask->task = task;
+         if (ff_queue_push_back(lltask_queue, lltask) < 0) {
+             av_freep(&lltask);
+-            return DNN_ERROR;
++            return AVERROR(ENOMEM);
+         }
+-        return DNN_SUCCESS;
++        return 0;
+     }
+     case DFT_ANALYTICS_CLASSIFY:
+     {
+@@ -597,7 +1113,7 @@ static DNNReturnType extract_lltask_from_task(DNNFunctionType func_type, TaskIte
+         task->inference_done = 0;
+ 
+         if (!contain_valid_detection_bbox(frame)) {
+-            return DNN_SUCCESS;
++            return 0;
+         }
+ 
+         sd = av_frame_get_side_data(frame, AV_FRAME_DATA_DETECTION_BBOXES);
+@@ -615,34 +1131,41 @@ static DNNReturnType extract_lltask_from_task(DNNFunctionType func_type, TaskIte
+ 
+             lltask = av_malloc(sizeof(*lltask));
+             if (!lltask) {
+-                return DNN_ERROR;
++                return AVERROR(ENOMEM);
+             }
+             task->inference_todo++;
+             lltask->task = task;
+             lltask->bbox_index = i;
+             if (ff_queue_push_back(lltask_queue, lltask) < 0) {
+                 av_freep(&lltask);
+-                return DNN_ERROR;
++                return AVERROR(ENOMEM);
+             }
+         }
+-        return DNN_SUCCESS;
++        return 0;
+     }
+     default:
+         av_assert0(!"should not reach here");
+-        return DNN_ERROR;
++        return AVERROR(EINVAL);
+     }
+ }
+ 
+-static DNNReturnType get_output_ov(void *model, const char *input_name, int input_width, int input_height,
++static int get_output_ov(void *model, const char *input_name, int input_width, int input_height,
+                                    const char *output_name, int *output_width, int *output_height)
+ {
+-    DNNReturnType ret;
++#if HAVE_OPENVINO2
++    ov_dimension_t dims[4] = {{1, 1}, {1, 1}, {input_height, input_height}, {input_width, input_width}};
++    ov_status_e status;
++    ov_shape_t input_shape = {0};
++    ov_partial_shape_t partial_shape;
++#else
++    IEStatusCode status;
++    input_shapes_t input_shapes;
++#endif
++    int ret;
+     OVModel *ov_model = model;
+     OVContext *ctx = &ov_model->ctx;
+     TaskItem task;
+     OVRequestItem *request;
+-    IEStatusCode status;
+-    input_shapes_t input_shapes;
+     DNNExecBaseParams exec_params = {
+         .input_name     = input_name,
+         .output_names   = &output_name,
+@@ -653,9 +1176,49 @@ static DNNReturnType get_output_ov(void *model, const char *input_name, int inpu
+ 
+     if (ov_model->model->func_type != DFT_PROCESS_FRAME) {
+         av_log(ctx, AV_LOG_ERROR, "Get output dim only when processing frame.\n");
+-        return DNN_ERROR;
++        return AVERROR(EINVAL);
++    }
++
++#if HAVE_OPENVINO2
++    if (ctx->options.input_resizable) {
++        if (!ov_model_is_dynamic(ov_model->ov_model)) {
++            status = ov_partial_shape_create(4, dims, &partial_shape);
++            if (status != OK) {
++                av_log(ctx, AV_LOG_ERROR, "Failed create partial shape.\n");
++                return ov2_map_error(status, NULL);
++            }
++            status = ov_const_port_get_shape(ov_model->input_port, &input_shape);
++            input_shape.dims[2] = input_height;
++            input_shape.dims[3] = input_width;
++            if (status != OK) {
++                av_log(ctx, AV_LOG_ERROR, "Failed create shape for model input resize.\n");
++                return ov2_map_error(status, NULL);
++            }
++
++            status = ov_shape_to_partial_shape(input_shape, &partial_shape);
++            if (status != OK) {
++                av_log(ctx, AV_LOG_ERROR, "Failed create partial shape for model input resize.\n");
++                return ov2_map_error(status, NULL);
++            }
++
++            status = ov_model_reshape_single_input(ov_model->ov_model, partial_shape);
++            if (status != OK) {
++                av_log(ctx, AV_LOG_ERROR, "Failed to reszie model input.\n");
++                return ov2_map_error(status, NULL);
++            }
++        } else {
++            avpriv_report_missing_feature(ctx, "Do not support dynamic model.");
++            return AVERROR(ENOTSUP);
++        }
+     }
+ 
++    status = ov_model_const_output_by_name(ov_model->ov_model, output_name, &ov_model->output_port);
++    if (status != OK) {
++        av_log(ctx, AV_LOG_ERROR, "Failed to get output port.\n");
++        return ov2_map_error(status, NULL);
++    }
++    if (!ov_model->compiled_model) {
++#else
+     if (ctx->options.input_resizable) {
+         status = ie_network_get_input_shapes(ov_model->network, &input_shapes);
+         input_shapes.shapes->shape.dims[2] = input_height;
+@@ -664,31 +1227,33 @@ static DNNReturnType get_output_ov(void *model, const char *input_name, int inpu
+         ie_network_input_shapes_free(&input_shapes);
+         if (status != OK) {
+             av_log(ctx, AV_LOG_ERROR, "Failed to reshape input size for %s\n", input_name);
+-            return DNN_ERROR;
++            return DNN_GENERIC_ERROR;
+         }
+     }
+-
+     if (!ov_model->exe_network) {
+-        if (init_model_ov(ov_model, input_name, output_name) != DNN_SUCCESS) {
++#endif
++        ret = init_model_ov(ov_model, input_name, output_name);
++        if (ret != 0) {
+             av_log(ctx, AV_LOG_ERROR, "Failed init OpenVINO exectuable network or inference request\n");
+-            return DNN_ERROR;
++            return ret;
+         }
+     }
+ 
+-    if (ff_dnn_fill_gettingoutput_task(&task, &exec_params, ov_model, input_height, input_width, ctx) != DNN_SUCCESS) {
+-        return DNN_ERROR;
++    ret = ff_dnn_fill_gettingoutput_task(&task, &exec_params, ov_model, input_height, input_width, ctx);
++    if (ret != 0) {
++        goto err;
+     }
+ 
+-    if (extract_lltask_from_task(ov_model->model->func_type, &task, ov_model->lltask_queue, NULL) != DNN_SUCCESS) {
+-        av_log(ctx, AV_LOG_ERROR, "unable to extract last level task from task.\n");
+-        ret = DNN_ERROR;
++    ret = extract_lltask_from_task(ov_model->model->func_type, &task, ov_model->lltask_queue, NULL);
++    if (ret != 0) {
++        av_log(ctx, AV_LOG_ERROR, "unable to extract inference from task.\n");
+         goto err;
+     }
+ 
+     request = ff_safe_queue_pop_front(ov_model->request_queue);
+     if (!request) {
+         av_log(ctx, AV_LOG_ERROR, "unable to get infer request.\n");
+-        ret = DNN_ERROR;
++        ret = AVERROR(EINVAL);
+         goto err;
+     }
+ 
+@@ -706,7 +1271,15 @@ DNNModel *ff_dnn_load_model_ov(const char *model_filename, DNNFunctionType func_
+     DNNModel *model = NULL;
+     OVModel *ov_model = NULL;
+     OVContext *ctx = NULL;
++#if HAVE_OPENVINO2
++    ov_core_t* core = NULL;
++    ov_model_t* ovmodel = NULL;
++    ov_status_e status;
++#else
++    size_t node_count = 0;
++    char *node_name = NULL;
+     IEStatusCode status;
++#endif
+ 
+     model = av_mallocz(sizeof(DNNModel));
+     if (!model){
+@@ -730,6 +1303,42 @@ DNNModel *ff_dnn_load_model_ov(const char *model_filename, DNNFunctionType func_
+         goto err;
+     }
+ 
++#if HAVE_OPENVINO2
++    status = ov_core_create(&core);
++    if (status != OK) {
++        goto err;
++    }
++
++    if (!strcmp(ctx->options.device_type, "CPU") && strcmp(ctx->options.threads, "UNSPECIFIED")) {
++        ov_core_set_property(core, ctx->options.device_type, "INFERENCE_NUM_THREADS", ctx->options.threads);
++    }
++    if (!strcmp(ctx->options.device_type, "CPU") && strcmp(ctx->options.nstreams, "UNSPECIFIED")) {
++        ov_core_set_property(core, ctx->options.device_type, "NUM_STREAMS", ctx->options.nstreams);
++    }
++    if (!strcmp(ctx->options.device_type, "CPU") && strcmp(ctx->options.pinning, "UNSPECIFIED")) {
++        ov_core_set_property(core, ctx->options.device_type, "ENABLE_CPU_PINNING", ctx->options.pinning);
++    }
++
++    ov_model->core = core;
++
++    status = ov_core_read_model(core, model_filename, NULL, &ovmodel);
++    if (status != OK) {
++        ov_version_t ver;
++        status = ov_get_openvino_version(&ver);
++        av_log(NULL, AV_LOG_ERROR, "Failed to read the network from model file %s,\n"
++                                  "Please check if the model version matches the runtime OpenVINO Version:\n",
++                                   model_filename);
++        if (status == OK) {
++            av_log(NULL, AV_LOG_ERROR, "BuildNumber: %s\n", ver.buildNumber);
++        }
++        ov_version_free(&ver);
++        goto err;
++    }
++    ov_model->ov_model = ovmodel;
++#else
++    ov_model->all_input_names = NULL;
++    ov_model->all_output_names = NULL;
++
+     status = ie_core_create("", &ov_model->core);
+     if (status != OK)
+         goto err;
+@@ -745,6 +1354,37 @@ DNNModel *ff_dnn_load_model_ov(const char *model_filename, DNNFunctionType func_
+         goto err;
+     }
+ 
++    //get all the input and output names
++    status = ie_network_get_inputs_number(ov_model->network, &node_count);
++    if (status != OK) {
++        av_log(ctx, AV_LOG_ERROR, "Failed to get input count\n");
++        goto err;
++    }
++    for (size_t i = 0; i < node_count; i++) {
++        status = ie_network_get_input_name(ov_model->network, i, &node_name);
++        if (status != OK) {
++            av_log(ctx, AV_LOG_ERROR, "Failed to get No.%d input's name\n", (int)i);
++            goto err;
++        }
++        APPEND_STRING(ov_model->all_input_names, node_name)
++        ie_network_name_free(&node_name);
++    }
++    status = ie_network_get_outputs_number(ov_model->network, &node_count);
++    if (status != OK) {
++        av_log(ctx, AV_LOG_ERROR, "Failed to get output count\n");
++        goto err;
++    }
++    for (size_t i = 0; i < node_count; i++) {
++        status = ie_network_get_output_name(ov_model->network, i, &node_name);
++        if (status != OK) {
++            av_log(ctx, AV_LOG_ERROR, "Failed to get No.%d output's name\n", (int)i);
++            goto err;
++        }
++        APPEND_STRING(ov_model->all_output_names, node_name)
++        ie_network_name_free(&node_name);
++    }
++#endif
++
+     model->get_input = &get_input_ov;
+     model->get_output = &get_output_ov;
+     model->options = options;
+@@ -758,45 +1398,53 @@ err:
+     return NULL;
+ }
+ 
+-DNNReturnType ff_dnn_execute_model_ov(const DNNModel *model, DNNExecBaseParams *exec_params)
++int ff_dnn_execute_model_ov(const DNNModel *model, DNNExecBaseParams *exec_params)
+ {
+     OVModel *ov_model = model->model;
+     OVContext *ctx = &ov_model->ctx;
+     OVRequestItem *request;
+     TaskItem *task;
+-    DNNReturnType ret;
++    int ret;
+ 
+-    if (ff_check_exec_params(ctx, DNN_OV, model->func_type, exec_params) != 0) {
+-        return DNN_ERROR;
++    ret = ff_check_exec_params(ctx, DNN_OV, model->func_type, exec_params);
++    if (ret != 0) {
++        return ret;
+     }
+ 
++#if HAVE_OPENVINO2
++    if (!ov_model->compiled_model) {
++#else
+     if (!ov_model->exe_network) {
+-        if (init_model_ov(ov_model, exec_params->input_name, exec_params->output_names[0]) != DNN_SUCCESS) {
++#endif
++        ret = init_model_ov(ov_model, exec_params->input_name, exec_params->output_names[0]);
++        if (ret != 0) {
+             av_log(ctx, AV_LOG_ERROR, "Failed init OpenVINO exectuable network or inference request\n");
+-            return DNN_ERROR;
++            return ret;
+         }
+     }
+ 
+     task = av_malloc(sizeof(*task));
+     if (!task) {
+         av_log(ctx, AV_LOG_ERROR, "unable to alloc memory for task item.\n");
+-        return DNN_ERROR;
++        return AVERROR(ENOMEM);
+     }
+ 
+-    if (ff_dnn_fill_task(task, exec_params, ov_model, ctx->options.async, 1) != DNN_SUCCESS) {
++    ret = ff_dnn_fill_task(task, exec_params, ov_model, ctx->options.async, 1);
++    if (ret != 0) {
+         av_freep(&task);
+-        return DNN_ERROR;
++        return ret;
+     }
+ 
+     if (ff_queue_push_back(ov_model->task_queue, task) < 0) {
+         av_freep(&task);
+         av_log(ctx, AV_LOG_ERROR, "unable to push back task_queue.\n");
+-        return DNN_ERROR;
++        return AVERROR(ENOMEM);
+     }
+ 
+-    if (extract_lltask_from_task(model->func_type, task, ov_model->lltask_queue, exec_params) != DNN_SUCCESS) {
++    ret = extract_lltask_from_task(model->func_type, task, ov_model->lltask_queue, exec_params);
++    if (ret != 0) {
+         av_log(ctx, AV_LOG_ERROR, "unable to extract inference from task.\n");
+-        return DNN_ERROR;
++        return ret;
+     }
+ 
+     if (ctx->options.async) {
+@@ -804,34 +1452,34 @@ DNNReturnType ff_dnn_execute_model_ov(const DNNModel *model, DNNExecBaseParams *
+             request = ff_safe_queue_pop_front(ov_model->request_queue);
+             if (!request) {
+                 av_log(ctx, AV_LOG_ERROR, "unable to get infer request.\n");
+-                return DNN_ERROR;
++                return AVERROR(EINVAL);
+             }
+ 
+             ret = execute_model_ov(request, ov_model->lltask_queue);
+-            if (ret != DNN_SUCCESS) {
++            if (ret != 0) {
+                 return ret;
+             }
+         }
+ 
+-        return DNN_SUCCESS;
++        return 0;
+     }
+     else {
+         if (model->func_type == DFT_ANALYTICS_CLASSIFY) {
+             // Classification filter has not been completely
+             // tested with the sync mode. So, do not support now.
+             avpriv_report_missing_feature(ctx, "classify for sync execution");
+-            return DNN_ERROR;
++            return AVERROR(ENOSYS);
+         }
+ 
+         if (ctx->options.batch_size > 1) {
+             avpriv_report_missing_feature(ctx, "batch mode for sync execution");
+-            return DNN_ERROR;
++            return AVERROR(ENOSYS);
+         }
+ 
+         request = ff_safe_queue_pop_front(ov_model->request_queue);
+         if (!request) {
+             av_log(ctx, AV_LOG_ERROR, "unable to get infer request.\n");
+-            return DNN_ERROR;
++            return AVERROR(EINVAL);
+         }
+         return execute_model_ov(request, ov_model->lltask_queue);
+     }
+@@ -843,79 +1491,52 @@ DNNAsyncStatusType ff_dnn_get_result_ov(const DNNModel *model, AVFrame **in, AVF
+     return ff_dnn_get_result_common(ov_model->task_queue, in, out);
+ }
+ 
+-DNNReturnType ff_dnn_flush_ov(const DNNModel *model)
++int ff_dnn_flush_ov(const DNNModel *model)
+ {
+     OVModel *ov_model = model->model;
+     OVContext *ctx = &ov_model->ctx;
+     OVRequestItem *request;
++#if HAVE_OPENVINO2
++    ov_status_e status;
++#else
+     IEStatusCode status;
+-    DNNReturnType ret;
++#endif
++    int ret;
+ 
+     if (ff_queue_size(ov_model->lltask_queue) == 0) {
+         // no pending task need to flush
+-        return DNN_SUCCESS;
++        return 0;
+     }
+ 
+     request = ff_safe_queue_pop_front(ov_model->request_queue);
+     if (!request) {
+         av_log(ctx, AV_LOG_ERROR, "unable to get infer request.\n");
+-        return DNN_ERROR;
++        return AVERROR(EINVAL);
+     }
+ 
+     ret = fill_model_input_ov(ov_model, request);
+-    if (ret != DNN_SUCCESS) {
++    if (ret != 0) {
+         av_log(ctx, AV_LOG_ERROR, "Failed to fill model input.\n");
+         return ret;
+     }
++#if HAVE_OPENVINO2
++    status = ov_infer_request_infer(request->infer_request);
++    if (status != OK) {
++        av_log(ctx, AV_LOG_ERROR, "Failed to start sync inference for OV2\n");
++        return ov2_map_error(status, NULL);
++    }
++#else
+     status = ie_infer_set_completion_callback(request->infer_request, &request->callback);
+     if (status != OK) {
+         av_log(ctx, AV_LOG_ERROR, "Failed to set completion callback for inference\n");
+-        return DNN_ERROR;
++        return DNN_GENERIC_ERROR;
+     }
+     status = ie_infer_request_infer_async(request->infer_request);
+     if (status != OK) {
+         av_log(ctx, AV_LOG_ERROR, "Failed to start async inference\n");
+-        return DNN_ERROR;
++        return DNN_GENERIC_ERROR;
+     }
++#endif
+ 
+-    return DNN_SUCCESS;
+-}
+-
+-void ff_dnn_free_model_ov(DNNModel **model)
+-{
+-    if (*model){
+-        OVModel *ov_model = (*model)->model;
+-        while (ff_safe_queue_size(ov_model->request_queue) != 0) {
+-            OVRequestItem *item = ff_safe_queue_pop_front(ov_model->request_queue);
+-            if (item && item->infer_request) {
+-                ie_infer_request_free(&item->infer_request);
+-            }
+-            av_freep(&item->lltasks);
+-            av_freep(&item);
+-        }
+-        ff_safe_queue_destroy(ov_model->request_queue);
+-
+-        while (ff_queue_size(ov_model->lltask_queue) != 0) {
+-            LastLevelTaskItem *item = ff_queue_pop_front(ov_model->lltask_queue);
+-            av_freep(&item);
+-        }
+-        ff_queue_destroy(ov_model->lltask_queue);
+-
+-        while (ff_queue_size(ov_model->task_queue) != 0) {
+-            TaskItem *item = ff_queue_pop_front(ov_model->task_queue);
+-            av_frame_free(&item->in_frame);
+-            av_frame_free(&item->out_frame);
+-            av_freep(&item);
+-        }
+-        ff_queue_destroy(ov_model->task_queue);
+-
+-        if (ov_model->exe_network)
+-            ie_exec_network_free(&ov_model->exe_network);
+-        if (ov_model->network)
+-            ie_network_free(&ov_model->network);
+-        if (ov_model->core)
+-            ie_core_free(&ov_model->core);
+-        av_freep(&ov_model);
+-        av_freep(model);
+-    }
+-}
++    return 0;
++}
+\ No newline at end of file
+diff --git a/libavfilter/dnn/dnn_backend_openvino.h b/libavfilter/dnn/dnn_backend_openvino.h
+index 0bbca0c057..304bc96b99 100644
+--- a/libavfilter/dnn/dnn_backend_openvino.h
++++ b/libavfilter/dnn/dnn_backend_openvino.h
+@@ -31,9 +31,9 @@
+ 
+ DNNModel *ff_dnn_load_model_ov(const char *model_filename, DNNFunctionType func_type, const char *options, AVFilterContext *filter_ctx);
+ 
+-DNNReturnType ff_dnn_execute_model_ov(const DNNModel *model, DNNExecBaseParams *exec_params);
++int ff_dnn_execute_model_ov(const DNNModel *model, DNNExecBaseParams *exec_params);
+ DNNAsyncStatusType ff_dnn_get_result_ov(const DNNModel *model, AVFrame **in, AVFrame **out);
+-DNNReturnType ff_dnn_flush_ov(const DNNModel *model);
++int ff_dnn_flush_ov(const DNNModel *model);
+ 
+ void ff_dnn_free_model_ov(DNNModel **model);
+ 
+diff --git a/libavfilter/dnn/dnn_io_proc.c b/libavfilter/dnn/dnn_io_proc.c
+index f55424d97c..ab656e8ed7 100644
+--- a/libavfilter/dnn/dnn_io_proc.c
++++ b/libavfilter/dnn/dnn_io_proc.c
+@@ -24,16 +24,59 @@
+ #include "libavutil/avassert.h"
+ #include "libavutil/detection_bbox.h"
+ 
+-DNNReturnType ff_proc_from_dnn_to_frame(AVFrame *frame, DNNData *output, void *log_ctx)
++static int get_datatype_size(DNNDataType dt)
++{
++    switch (dt)
++    {
++    case DNN_FLOAT:
++        return sizeof(float);
++    case DNN_UINT8:
++        return sizeof(uint8_t);
++    default:
++        av_assert0(!"not supported yet.");
++        return 1;
++    }
++}
++
++int ff_proc_from_dnn_to_frame(AVFrame *frame, DNNData *output, void *log_ctx)
+ {
+     struct SwsContext *sws_ctx;
++    int ret = 0;
++    int linesize[4] = { 0 };
++    void **dst_data = NULL;
++    void *middle_data = NULL;
++    uint8_t *planar_data[4] = { 0 };
++    int plane_size = frame->width * frame->height * sizeof(uint8_t);
++    enum AVPixelFormat src_fmt = AV_PIX_FMT_NONE;
++    int src_datatype_size = get_datatype_size(output->dt);
++
+     int bytewidth = av_image_get_linesize(frame->format, frame->width, 0);
+     if (bytewidth < 0) {
+-        return DNN_ERROR;
++        return AVERROR(EINVAL);
++    }
++    /* scale == 1 and mean == 0 and dt == UINT8: passthrough */
++    if (fabsf(output->scale - 1) < 1e-6f && fabsf(output->mean) < 1e-6 && output->dt == DNN_UINT8)
++        src_fmt = AV_PIX_FMT_GRAY8;
++    /* (scale == 255 or scale == 0) and mean == 0 and dt == FLOAT: normalization */
++    else if ((fabsf(output->scale - 255) < 1e-6f || fabsf(output->scale) < 1e-6f) &&
++             fabsf(output->mean) < 1e-6 && output->dt == DNN_FLOAT)
++        src_fmt = AV_PIX_FMT_GRAYF32;
++    else {
++        av_log(log_ctx, AV_LOG_ERROR, "dnn_process output data doesn't type: UINT8 "
++                                      "scale: %f, mean: %f\n", output->scale, output->mean);
++        return AVERROR(ENOSYS);
+     }
+-    if (output->dt != DNN_FLOAT) {
+-        avpriv_report_missing_feature(log_ctx, "data type rather than DNN_FLOAT");
+-        return DNN_ERROR;
++
++    dst_data = (void **)frame->data;
++    linesize[0] = frame->linesize[0];
++    if (output->layout == DL_NCHW) {
++        middle_data = av_malloc(plane_size * output->channels);
++        if (!middle_data) {
++            ret = AVERROR(ENOMEM);
++            goto err;
++        }
++        dst_data = &middle_data;
++        linesize[0] = frame->width * 3;
+     }
+ 
+     switch (frame->format) {
+@@ -41,7 +84,7 @@ DNNReturnType ff_proc_from_dnn_to_frame(AVFrame *frame, DNNData *output, void *l
+     case AV_PIX_FMT_BGR24:
+         sws_ctx = sws_getContext(frame->width * 3,
+                                  frame->height,
+-                                 AV_PIX_FMT_GRAYF32,
++                                 src_fmt,
+                                  frame->width * 3,
+                                  frame->height,
+                                  AV_PIX_FMT_GRAY8,
+@@ -49,20 +92,54 @@ DNNReturnType ff_proc_from_dnn_to_frame(AVFrame *frame, DNNData *output, void *l
+         if (!sws_ctx) {
+             av_log(log_ctx, AV_LOG_ERROR, "Impossible to create scale context for the conversion "
+                 "fmt:%s s:%dx%d -> fmt:%s s:%dx%d\n",
+-                av_get_pix_fmt_name(AV_PIX_FMT_GRAYF32), frame->width * 3, frame->height,
++                av_get_pix_fmt_name(src_fmt), frame->width * 3, frame->height,
+                 av_get_pix_fmt_name(AV_PIX_FMT_GRAY8),   frame->width * 3, frame->height);
+-            return DNN_ERROR;
++            ret = AVERROR(EINVAL);
++            goto err;
+         }
+         sws_scale(sws_ctx, (const uint8_t *[4]){(const uint8_t *)output->data, 0, 0, 0},
+-                           (const int[4]){frame->width * 3 * sizeof(float), 0, 0, 0}, 0, frame->height,
+-                           (uint8_t * const*)frame->data, frame->linesize);
++                           (const int[4]){frame->width * 3 * src_datatype_size, 0, 0, 0}, 0, frame->height,
++                           (uint8_t * const*)dst_data, linesize);
+         sws_freeContext(sws_ctx);
+-        return DNN_SUCCESS;
++        // convert data from planar to packed
++        if (output->layout == DL_NCHW) {
++            sws_ctx = sws_getContext(frame->width,
++                                     frame->height,
++                                     AV_PIX_FMT_GBRP,
++                                     frame->width,
++                                     frame->height,
++                                     frame->format,
++                                     0, NULL, NULL, NULL);
++            if (!sws_ctx) {
++                av_log(log_ctx, AV_LOG_ERROR, "Impossible to create scale context for the conversion "
++                       "fmt:%s s:%dx%d -> fmt:%s s:%dx%d\n",
++                       av_get_pix_fmt_name(AV_PIX_FMT_GBRP), frame->width, frame->height,
++                       av_get_pix_fmt_name(frame->format),frame->width, frame->height);
++                ret = AVERROR(EINVAL);
++                goto err;
++            }
++            if (frame->format == AV_PIX_FMT_RGB24) {
++                planar_data[0] = (uint8_t *)middle_data + plane_size;
++                planar_data[1] = (uint8_t *)middle_data + plane_size * 2;
++                planar_data[2] = (uint8_t *)middle_data;
++            } else if (frame->format == AV_PIX_FMT_BGR24) {
++                planar_data[0] = (uint8_t *)middle_data + plane_size;
++                planar_data[1] = (uint8_t *)middle_data;
++                planar_data[2] = (uint8_t *)middle_data + plane_size * 2;
++            }
++            sws_scale(sws_ctx, (const uint8_t * const *)planar_data,
++                      (const int [4]){frame->width * sizeof(uint8_t),
++                                      frame->width * sizeof(uint8_t),
++                                      frame->width * sizeof(uint8_t), 0},
++                      0, frame->height, frame->data, frame->linesize);
++            sws_freeContext(sws_ctx);
++        }
++        break;
+     case AV_PIX_FMT_GRAYF32:
+         av_image_copy_plane(frame->data[0], frame->linesize[0],
+                             output->data, bytewidth,
+                             bytewidth, frame->height);
+-        return DNN_SUCCESS;
++        break;
+     case AV_PIX_FMT_YUV420P:
+     case AV_PIX_FMT_YUV422P:
+     case AV_PIX_FMT_YUV444P:
+@@ -80,56 +157,122 @@ DNNReturnType ff_proc_from_dnn_to_frame(AVFrame *frame, DNNData *output, void *l
+         if (!sws_ctx) {
+             av_log(log_ctx, AV_LOG_ERROR, "Impossible to create scale context for the conversion "
+                 "fmt:%s s:%dx%d -> fmt:%s s:%dx%d\n",
+-                av_get_pix_fmt_name(AV_PIX_FMT_GRAYF32), frame->width, frame->height,
++                av_get_pix_fmt_name(src_fmt), frame->width, frame->height,
+                 av_get_pix_fmt_name(AV_PIX_FMT_GRAY8),   frame->width, frame->height);
+-            return DNN_ERROR;
++            ret = AVERROR(EINVAL);
++            goto err;
+         }
+         sws_scale(sws_ctx, (const uint8_t *[4]){(const uint8_t *)output->data, 0, 0, 0},
+-                           (const int[4]){frame->width * sizeof(float), 0, 0, 0}, 0, frame->height,
++                           (const int[4]){frame->width * src_datatype_size, 0, 0, 0}, 0, frame->height,
+                            (uint8_t * const*)frame->data, frame->linesize);
+         sws_freeContext(sws_ctx);
+-        return DNN_SUCCESS;
++        break;
+     default:
+         avpriv_report_missing_feature(log_ctx, "%s", av_get_pix_fmt_name(frame->format));
+-        return DNN_ERROR;
++        ret = AVERROR(ENOSYS);
++        goto err;
+     }
+ 
+-    return DNN_SUCCESS;
++err:
++    av_free(middle_data);
++    return ret;
+ }
+ 
+-DNNReturnType ff_proc_from_frame_to_dnn(AVFrame *frame, DNNData *input, void *log_ctx)
++int ff_proc_from_frame_to_dnn(AVFrame *frame, DNNData *input, void *log_ctx)
+ {
+     struct SwsContext *sws_ctx;
++    int ret = 0;
++    int linesize[4] = { 0 };
++    void **src_data = NULL;
++    void *middle_data = NULL;
++    uint8_t *planar_data[4] = { 0 };
++    int plane_size = frame->width * frame->height * sizeof(uint8_t);
++    enum AVPixelFormat dst_fmt = AV_PIX_FMT_NONE;
++    int dst_datatype_size = get_datatype_size(input->dt);
+     int bytewidth = av_image_get_linesize(frame->format, frame->width, 0);
+     if (bytewidth < 0) {
+-        return DNN_ERROR;
++        return AVERROR(EINVAL);
+     }
+-    if (input->dt != DNN_FLOAT) {
+-        avpriv_report_missing_feature(log_ctx, "data type rather than DNN_FLOAT");
+-        return DNN_ERROR;
++    /* scale == 1 and mean == 0 and dt == UINT8: passthrough */
++    if (fabsf(input->scale - 1) < 1e-6f && fabsf(input->mean) < 1e-6 && input->dt == DNN_UINT8)
++        dst_fmt = AV_PIX_FMT_GRAY8;
++    /* (scale == 255 or scale == 0) and mean == 0 and dt == FLOAT: normalization */
++    else if ((fabsf(input->scale - 255) < 1e-6f || fabsf(input->scale) < 1e-6f) &&
++             fabsf(input->mean) < 1e-6 && input->dt == DNN_FLOAT)
++        dst_fmt = AV_PIX_FMT_GRAYF32;
++    else {
++        av_log(log_ctx, AV_LOG_ERROR, "dnn_process input data doesn't support type: UINT8 "
++                                      "scale: %f, mean: %f\n", input->scale, input->mean);
++        return AVERROR(ENOSYS);
++    }
++
++    src_data = (void **)frame->data;
++    linesize[0] = frame->linesize[0];
++    if (input->layout == DL_NCHW) {
++        middle_data = av_malloc(plane_size * input->channels);
++        if (!middle_data) {
++            ret = AVERROR(ENOMEM);
++            goto err;
++        }
++        src_data = &middle_data;
++        linesize[0] = frame->width * 3;
+     }
+ 
+     switch (frame->format) {
+     case AV_PIX_FMT_RGB24:
+     case AV_PIX_FMT_BGR24:
++        // convert data from planar to packed
++        if (input->layout == DL_NCHW) {
++            sws_ctx = sws_getContext(frame->width,
++                                     frame->height,
++                                     frame->format,
++                                     frame->width,
++                                     frame->height,
++                                     AV_PIX_FMT_GBRP,
++                                     0, NULL, NULL, NULL);
++            if (!sws_ctx) {
++                av_log(log_ctx, AV_LOG_ERROR, "Impossible to create scale context for the conversion "
++                       "fmt:%s s:%dx%d -> fmt:%s s:%dx%d\n",
++                       av_get_pix_fmt_name(frame->format), frame->width, frame->height,
++                       av_get_pix_fmt_name(AV_PIX_FMT_GBRP),frame->width, frame->height);
++                ret = AVERROR(EINVAL);
++                goto err;
++            }
++            if (frame->format == AV_PIX_FMT_RGB24) {
++                planar_data[0] = (uint8_t *)middle_data + plane_size;
++                planar_data[1] = (uint8_t *)middle_data + plane_size * 2;
++                planar_data[2] = (uint8_t *)middle_data;
++            } else if (frame->format == AV_PIX_FMT_BGR24) {
++                planar_data[0] = (uint8_t *)middle_data + plane_size;
++                planar_data[1] = (uint8_t *)middle_data;
++                planar_data[2] = (uint8_t *)middle_data + plane_size * 2;
++            }
++            sws_scale(sws_ctx, (const uint8_t * const *)frame->data,
++                      frame->linesize, 0, frame->height, planar_data,
++                      (const int [4]){frame->width * sizeof(uint8_t),
++                                      frame->width * sizeof(uint8_t),
++                                      frame->width * sizeof(uint8_t), 0});
++            sws_freeContext(sws_ctx);
++        }
+         sws_ctx = sws_getContext(frame->width * 3,
+                                  frame->height,
+                                  AV_PIX_FMT_GRAY8,
+                                  frame->width * 3,
+                                  frame->height,
+-                                 AV_PIX_FMT_GRAYF32,
++                                 dst_fmt,
+                                  0, NULL, NULL, NULL);
+         if (!sws_ctx) {
+             av_log(log_ctx, AV_LOG_ERROR, "Impossible to create scale context for the conversion "
+                 "fmt:%s s:%dx%d -> fmt:%s s:%dx%d\n",
+                 av_get_pix_fmt_name(AV_PIX_FMT_GRAY8),  frame->width * 3, frame->height,
+-                av_get_pix_fmt_name(AV_PIX_FMT_GRAYF32),frame->width * 3, frame->height);
+-            return DNN_ERROR;
++                av_get_pix_fmt_name(dst_fmt),frame->width * 3, frame->height);
++            ret = AVERROR(EINVAL);
++            goto err;
+         }
+-        sws_scale(sws_ctx, (const uint8_t **)frame->data,
+-                           frame->linesize, 0, frame->height,
++        sws_scale(sws_ctx, (const uint8_t **)src_data,
++                           linesize, 0, frame->height,
+                            (uint8_t * const [4]){input->data, 0, 0, 0},
+-                           (const int [4]){frame->width * 3 * sizeof(float), 0, 0, 0});
++                           (const int [4]){frame->width * 3 * dst_datatype_size, 0, 0, 0});
+         sws_freeContext(sws_ctx);
+         break;
+     case AV_PIX_FMT_GRAYF32:
+@@ -149,27 +292,30 @@ DNNReturnType ff_proc_from_frame_to_dnn(AVFrame *frame, DNNData *input, void *lo
+                                  AV_PIX_FMT_GRAY8,
+                                  frame->width,
+                                  frame->height,
+-                                 AV_PIX_FMT_GRAYF32,
++                                 dst_fmt,
+                                  0, NULL, NULL, NULL);
+         if (!sws_ctx) {
+             av_log(log_ctx, AV_LOG_ERROR, "Impossible to create scale context for the conversion "
+                 "fmt:%s s:%dx%d -> fmt:%s s:%dx%d\n",
+                 av_get_pix_fmt_name(AV_PIX_FMT_GRAY8),  frame->width, frame->height,
+-                av_get_pix_fmt_name(AV_PIX_FMT_GRAYF32),frame->width, frame->height);
+-            return DNN_ERROR;
++                av_get_pix_fmt_name(dst_fmt),frame->width, frame->height);
++            ret = AVERROR(EINVAL);
++            goto err;
+         }
+         sws_scale(sws_ctx, (const uint8_t **)frame->data,
+                            frame->linesize, 0, frame->height,
+                            (uint8_t * const [4]){input->data, 0, 0, 0},
+-                           (const int [4]){frame->width * sizeof(float), 0, 0, 0});
++                           (const int [4]){frame->width * dst_datatype_size, 0, 0, 0});
+         sws_freeContext(sws_ctx);
+         break;
+     default:
+         avpriv_report_missing_feature(log_ctx, "%s", av_get_pix_fmt_name(frame->format));
+-        return DNN_ERROR;
++        ret = AVERROR(ENOSYS);
++        goto err;
+     }
+-
+-    return DNN_SUCCESS;
++err:
++    av_free(middle_data);
++    return ret;
+ }
+ 
+ static enum AVPixelFormat get_pixel_format(DNNData *data)
+@@ -190,13 +336,14 @@ static enum AVPixelFormat get_pixel_format(DNNData *data)
+     return AV_PIX_FMT_BGR24;
+ }
+ 
+-DNNReturnType ff_frame_to_dnn_classify(AVFrame *frame, DNNData *input, uint32_t bbox_index, void *log_ctx)
++int ff_frame_to_dnn_classify(AVFrame *frame, DNNData *input, uint32_t bbox_index, void *log_ctx)
+ {
+     const AVPixFmtDescriptor *desc;
+     int offsetx[4], offsety[4];
+     uint8_t *bbox_data[4];
+     struct SwsContext *sws_ctx;
+     int linesizes[4];
++    int ret = 0;
+     enum AVPixelFormat fmt;
+     int left, top, width, height;
+     const AVDetectionBBoxHeader *header;
+@@ -204,6 +351,19 @@ DNNReturnType ff_frame_to_dnn_classify(AVFrame *frame, DNNData *input, uint32_t
+     AVFrameSideData *sd = av_frame_get_side_data(frame, AV_FRAME_DATA_DETECTION_BBOXES);
+     av_assert0(sd);
+ 
++    /* (scale != 1 and scale != 0) or mean != 0 */
++    if ((fabsf(input->scale - 1) > 1e-6f && fabsf(input->scale) > 1e-6f) ||
++        fabsf(input->mean) > 1e-6f) {
++        av_log(log_ctx, AV_LOG_ERROR, "dnn_classify input data doesn't support "
++                                      "scale: %f, mean: %f\n", input->scale, input->mean);
++        return AVERROR(ENOSYS);
++    }
++
++    if (input->layout == DL_NCHW) {
++        av_log(log_ctx, AV_LOG_ERROR, "dnn_classify input data doesn't support layout: NCHW\n");
++        return AVERROR(ENOSYS);
++    }
++
+     header = (const AVDetectionBBoxHeader *)sd->data;
+     bbox = av_get_detection_bbox(header, bbox_index);
+ 
+@@ -221,13 +381,14 @@ DNNReturnType ff_frame_to_dnn_classify(AVFrame *frame, DNNData *input, uint32_t
+                "fmt:%s s:%dx%d -> fmt:%s s:%dx%d\n",
+                av_get_pix_fmt_name(frame->format), width, height,
+                av_get_pix_fmt_name(fmt), input->width, input->height);
+-        return DNN_ERROR;
++        return AVERROR(EINVAL);
+     }
+ 
+-    if (av_image_fill_linesizes(linesizes, fmt, input->width) < 0) {
++    ret = av_image_fill_linesizes(linesizes, fmt, input->width);
++    if (ret < 0) {
+         av_log(log_ctx, AV_LOG_ERROR, "unable to get linesizes with av_image_fill_linesizes");
+         sws_freeContext(sws_ctx);
+-        return DNN_ERROR;
++        return ret;
+     }
+ 
+     desc = av_pix_fmt_desc_get(frame->format);
+@@ -246,14 +407,29 @@ DNNReturnType ff_frame_to_dnn_classify(AVFrame *frame, DNNData *input, uint32_t
+ 
+     sws_freeContext(sws_ctx);
+ 
+-    return DNN_SUCCESS;
++    return ret;
+ }
+ 
+-DNNReturnType ff_frame_to_dnn_detect(AVFrame *frame, DNNData *input, void *log_ctx)
++int ff_frame_to_dnn_detect(AVFrame *frame, DNNData *input, void *log_ctx)
+ {
+     struct SwsContext *sws_ctx;
+     int linesizes[4];
++    int ret = 0;
+     enum AVPixelFormat fmt = get_pixel_format(input);
++
++    /* (scale != 1 and scale != 0) or mean != 0 */
++    if ((fabsf(input->scale - 1) > 1e-6f && fabsf(input->scale) > 1e-6f) ||
++        fabsf(input->mean) > 1e-6f) {
++        av_log(log_ctx, AV_LOG_ERROR, "dnn_detect input data doesn't support "
++                                      "scale: %f, mean: %f\n", input->scale, input->mean);
++        return AVERROR(ENOSYS);
++    }
++
++    if (input->layout == DL_NCHW) {
++        av_log(log_ctx, AV_LOG_ERROR, "dnn_detect input data doesn't support layout: NCHW\n");
++        return AVERROR(ENOSYS);
++    }
++
+     sws_ctx = sws_getContext(frame->width, frame->height, frame->format,
+                              input->width, input->height, fmt,
+                              SWS_FAST_BILINEAR, NULL, NULL, NULL);
+@@ -262,18 +438,19 @@ DNNReturnType ff_frame_to_dnn_detect(AVFrame *frame, DNNData *input, void *log_c
+             "fmt:%s s:%dx%d -> fmt:%s s:%dx%d\n",
+             av_get_pix_fmt_name(frame->format), frame->width, frame->height,
+             av_get_pix_fmt_name(fmt), input->width, input->height);
+-        return DNN_ERROR;
++        return AVERROR(EINVAL);
+     }
+ 
+-    if (av_image_fill_linesizes(linesizes, fmt, input->width) < 0) {
++    ret = av_image_fill_linesizes(linesizes, fmt, input->width);
++    if (ret < 0) {
+         av_log(log_ctx, AV_LOG_ERROR, "unable to get linesizes with av_image_fill_linesizes");
+         sws_freeContext(sws_ctx);
+-        return DNN_ERROR;
++        return ret;
+     }
+ 
+     sws_scale(sws_ctx, (const uint8_t *const *)frame->data, frame->linesize, 0, frame->height,
+                        (uint8_t *const [4]){input->data, 0, 0, 0}, linesizes);
+ 
+     sws_freeContext(sws_ctx);
+-    return DNN_SUCCESS;
++    return ret;
+ }
+diff --git a/libavfilter/dnn/dnn_io_proc.h b/libavfilter/dnn/dnn_io_proc.h
+index daef01aceb..a3dd94675b 100644
+--- a/libavfilter/dnn/dnn_io_proc.h
++++ b/libavfilter/dnn/dnn_io_proc.h
+@@ -30,9 +30,9 @@
+ #include "../dnn_interface.h"
+ #include "libavutil/frame.h"
+ 
+-DNNReturnType ff_proc_from_frame_to_dnn(AVFrame *frame, DNNData *input, void *log_ctx);
+-DNNReturnType ff_proc_from_dnn_to_frame(AVFrame *frame, DNNData *output, void *log_ctx);
+-DNNReturnType ff_frame_to_dnn_detect(AVFrame *frame, DNNData *input, void *log_ctx);
+-DNNReturnType ff_frame_to_dnn_classify(AVFrame *frame, DNNData *input, uint32_t bbox_index, void *log_ctx);
++int ff_proc_from_frame_to_dnn(AVFrame *frame, DNNData *input, void *log_ctx);
++int ff_proc_from_dnn_to_frame(AVFrame *frame, DNNData *output, void *log_ctx);
++int ff_frame_to_dnn_detect(AVFrame *frame, DNNData *input, void *log_ctx);
++int ff_frame_to_dnn_classify(AVFrame *frame, DNNData *input, uint32_t bbox_index, void *log_ctx);
+ 
+ #endif
+diff --git a/libavfilter/dnn_interface.h b/libavfilter/dnn_interface.h
+index 37e89d9789..12262fec6f 100644
+--- a/libavfilter/dnn_interface.h
++++ b/libavfilter/dnn_interface.h
+@@ -30,6 +30,8 @@
+ #include "libavutil/frame.h"
+ #include "avfilter.h"
+ 
++#define DNN_GENERIC_ERROR FFERRTAG('D','N','N','!')
++
+ typedef enum {DNN_SUCCESS, DNN_ERROR} DNNReturnType;
+ 
+ typedef enum {DNN_NATIVE, DNN_TF, DNN_OV} DNNBackendType;
+@@ -56,12 +58,21 @@ typedef enum {
+     DFT_ANALYTICS_CLASSIFY, // classify for each bounding box
+ }DNNFunctionType;
+ 
++typedef enum {
++    DL_NONE,
++    DL_NCHW,
++    DL_NHWC,
++} DNNLayout;
++
+ typedef struct DNNData{
+     void *data;
+     int width, height, channels;
+     // dt and order together decide the color format
+     DNNDataType dt;
+     DNNColorOrder order;
++    DNNLayout layout;
++    float scale;
++    float mean;
+ } DNNData;
+ 
+ typedef struct DNNExecBaseParams {
+@@ -92,9 +103,9 @@ typedef struct DNNModel{
+     DNNFunctionType func_type;
+     // Gets model input information
+     // Just reuse struct DNNData here, actually the DNNData.data field is not needed.
+-    DNNReturnType (*get_input)(void *model, DNNData *input, const char *input_name);
++    int (*get_input)(void *model, DNNData *input, const char *input_name);
+     // Gets model output width/height with given input w/h
+-    DNNReturnType (*get_output)(void *model, const char *input_name, int input_width, int input_height,
++    int (*get_output)(void *model, const char *input_name, int input_width, int input_height,
+                                 const char *output_name, int *output_width, int *output_height);
+     // set the pre process to transfer data from AVFrame to DNNData
+     // the default implementation within DNN is used if it is not provided by the filter
+@@ -113,11 +124,11 @@ typedef struct DNNModule{
+     // Loads model and parameters from given file. Returns NULL if it is not possible.
+     DNNModel *(*load_model)(const char *model_filename, DNNFunctionType func_type, const char *options, AVFilterContext *filter_ctx);
+     // Executes model with specified input and output. Returns DNN_ERROR otherwise.
+-    DNNReturnType (*execute_model)(const DNNModel *model, DNNExecBaseParams *exec_params);
++    int (*execute_model)(const DNNModel *model, DNNExecBaseParams *exec_params);
+     // Retrieve inference result.
+     DNNAsyncStatusType (*get_result)(const DNNModel *model, AVFrame **in, AVFrame **out);
+     // Flush all the pending tasks.
+-    DNNReturnType (*flush)(const DNNModel *model);
++    int (*flush)(const DNNModel *model);
+     // Frees memory allocated for model.
+     void (*free_model)(DNNModel **model);
+ } DNNModule;
+-- 
+2.39.0
+
