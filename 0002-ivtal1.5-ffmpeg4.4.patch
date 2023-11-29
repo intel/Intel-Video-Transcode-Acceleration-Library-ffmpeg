@@ -1,6 +1,6 @@
-From 9bb842bdfe304aa3d6a1033f4c62c3f04e60a17d Mon Sep 17 00:00:00 2001
+From 19d054164adeb1ce06cbd27c8539c341d931f903 Mon Sep 17 00:00:00 2001
 From: sstate0818 <jie.tian@intel.com>
-Date: Thu, 9 Nov 2023 13:14:18 +0800
+Date: Wed, 29 Nov 2023 14:04:29 +0800
 Subject: [PATCH] IVTAL ffmpeg4.4 release/1.5
 
 ---
@@ -12,17 +12,17 @@ Subject: [PATCH] IVTAL ffmpeg4.4 release/1.5
  libavfilter/dnn/dnn_backend_common.c   |  179 ++++
  libavfilter/dnn/dnn_backend_common.h   |  153 +++
  libavfilter/dnn/dnn_backend_native.c   |    2 +-
- libavfilter/dnn/dnn_backend_openvino.c | 1276 ++++++++++++++++++------
+ libavfilter/dnn/dnn_backend_openvino.c | 1275 ++++++++++++++++++------
  libavfilter/dnn/dnn_backend_openvino.h |    9 +-
  libavfilter/dnn/dnn_interface.c        |    5 +-
- libavfilter/dnn/dnn_io_proc.c          |  282 ++++--
+ libavfilter/dnn/dnn_io_proc.c          |  281 ++++--
  libavfilter/dnn/dnn_io_proc.h          |    4 +-
  libavfilter/dnn/queue.h                |    1 +
  libavfilter/dnn_filter_common.c        |   44 +-
  libavfilter/dnn_filter_common.h        |   14 +-
  libavfilter/dnn_interface.h            |   46 +-
  libavfilter/vf_dnn_processing.c        |   93 +-
- 18 files changed, 1575 insertions(+), 556 deletions(-)
+ 18 files changed, 1573 insertions(+), 556 deletions(-)
  create mode 100644 libavfilter/dnn/dnn_backend_common.c
  create mode 100644 libavfilter/dnn/dnn_backend_common.h
 
@@ -477,17 +477,16 @@ index d8ae36c52d..49f17c7c93 100644
      }
  
 diff --git a/libavfilter/dnn/dnn_backend_openvino.c b/libavfilter/dnn/dnn_backend_openvino.c
-index 9a47d74c15..393f5bf732 100644
+index 9a47d74c15..d7e6a0a85b 100644
 --- a/libavfilter/dnn/dnn_backend_openvino.c
 +++ b/libavfilter/dnn/dnn_backend_openvino.c
-@@ -27,18 +27,31 @@
+@@ -27,18 +27,30 @@
  #include "dnn_io_proc.h"
  #include "libavformat/avio.h"
  #include "libavutil/avassert.h"
 +#include "libavutil/cpu.h"
  #include "libavutil/opt.h"
  #include "libavutil/avstring.h"
-+#include "libavutil/detection_bbox.h"
  #include "../internal.h"
 -#include "queue.h"
  #include "safe_queue.h"
@@ -513,7 +512,7 @@ index 9a47d74c15..393f5bf732 100644
  } OVOptions;
  
  typedef struct OVContext {
-@@ -49,33 +62,40 @@ typedef struct OVContext {
+@@ -49,33 +61,40 @@ typedef struct OVContext {
  typedef struct OVModel{
      OVContext ctx;
      DNNModel *model;
@@ -574,7 +573,7 @@ index 9a47d74c15..393f5bf732 100644
  
  #define APPEND_STRING(generated_string, iterate_string)                                            \
      generated_string = generated_string ? av_asprintf("%s %s", generated_string, iterate_string) : \
-@@ -85,19 +105,78 @@ typedef struct RequestItem {
+@@ -85,19 +104,78 @@ typedef struct RequestItem {
  #define FLAGS AV_OPT_FLAG_FILTERING_PARAM
  static const AVOption dnn_openvino_options[] = {
      { "device", "device to run model", OFFSET(options.device_type), AV_OPT_TYPE_STRING, { .str = "CPU" }, 0, 0, FLAGS },
@@ -654,7 +653,7 @@ index 9a47d74c15..393f5bf732 100644
          return DNN_FLOAT;
      case U8:
          return DNN_UINT8;
-@@ -121,21 +200,75 @@ static int get_datatype_size(DNNDataType dt)
+@@ -121,21 +199,75 @@ static int get_datatype_size(DNNDataType dt)
      }
  }
  
@@ -736,7 +735,7 @@ index 9a47d74c15..393f5bf732 100644
      }
  
      status |= ie_blob_get_dims(input_blob, &dims);
-@@ -143,71 +276,133 @@ static DNNReturnType fill_model_input_ov(OVModel *ov_model, RequestItem *request
+@@ -143,71 +275,133 @@ static DNNReturnType fill_model_input_ov(OVModel *ov_model, RequestItem *request
      if (status != OK) {
          ie_blob_free(&input_blob);
          av_log(ctx, AV_LOG_ERROR, "Failed to get input blob dims/precision\n");
@@ -903,7 +902,7 @@ index 9a47d74c15..393f5bf732 100644
          return;
      }
  
-@@ -225,84 +420,322 @@ static void infer_completion_callback(void *args)
+@@ -225,84 +419,322 @@ static void infer_completion_callback(void *args)
          av_log(ctx, AV_LOG_ERROR, "Failed to get dims or precision of output\n");
          return;
      }
@@ -1253,7 +1252,7 @@ index 9a47d74c15..393f5bf732 100644
      // ask openvino to do the conversion internally.
      // the current supported SR model (frame processing) is generated from tensorflow model,
      // and its input is Y channel as float with range [0.0f, 1.0f], so do not set for this case.
-@@ -311,6 +744,7 @@ static DNNReturnType init_model_ov(OVModel *ov_model, const char *input_name, co
+@@ -311,6 +743,7 @@ static DNNReturnType init_model_ov(OVModel *ov_model, const char *input_name, co
          status = ie_network_set_input_precision(ov_model->network, input_name, U8);
          if (status != OK) {
              av_log(ctx, AV_LOG_ERROR, "Failed to set input precision as U8 for %s\n", input_name);
@@ -1261,7 +1260,7 @@ index 9a47d74c15..393f5bf732 100644
              goto err;
          }
      }
-@@ -321,6 +755,7 @@ static DNNReturnType init_model_ov(OVModel *ov_model, const char *input_name, co
+@@ -321,6 +754,7 @@ static DNNReturnType init_model_ov(OVModel *ov_model, const char *input_name, co
          status = ie_core_get_available_devices(ov_model->core, &a_dev);
          if (status != OK) {
              av_log(ctx, AV_LOG_ERROR, "Failed to get available devices\n");
@@ -1269,7 +1268,7 @@ index 9a47d74c15..393f5bf732 100644
              goto err;
          }
          for (int i = 0; i < a_dev.num_devices; i++) {
-@@ -328,14 +763,10 @@ static DNNReturnType init_model_ov(OVModel *ov_model, const char *input_name, co
+@@ -328,14 +762,10 @@ static DNNReturnType init_model_ov(OVModel *ov_model, const char *input_name, co
          }
          av_log(ctx, AV_LOG_ERROR,"device %s may not be supported, all available devices are: \"%s\"\n",
                 ctx->options.device_type, all_dev_names);
@@ -1286,7 +1285,7 @@ index 9a47d74c15..393f5bf732 100644
      // create infer_requests for async execution
      if (ctx->options.nireq <= 0) {
          // the default value is a rough estimation
-@@ -344,114 +775,232 @@ static DNNReturnType init_model_ov(OVModel *ov_model, const char *input_name, co
+@@ -344,114 +774,232 @@ static DNNReturnType init_model_ov(OVModel *ov_model, const char *input_name, co
  
      ov_model->request_queue = ff_safe_queue_create();
      if (!ov_model->request_queue) {
@@ -1554,7 +1553,7 @@ index 9a47d74c15..393f5bf732 100644
          }
          if (strcmp(model_input_name, input_name) == 0) {
              ie_network_name_free(&model_input_name);
-@@ -459,40 +1008,118 @@ static DNNReturnType get_input_ov(void *model, DNNData *input, const char *input
+@@ -459,40 +1007,118 @@ static DNNReturnType get_input_ov(void *model, DNNData *input, const char *input
              status |= ie_network_get_input_precision(ov_model->network, input_name, &precision);
              if (status != OK) {
                  av_log(ctx, AV_LOG_ERROR, "Failed to get No.%d input's dims or precision\n", (int)i);
@@ -1688,7 +1687,7 @@ index 9a47d74c15..393f5bf732 100644
      if (ctx->options.input_resizable) {
          status = ie_network_get_input_shapes(ov_model->network, &input_shapes);
          input_shapes.shapes->shape.dims[2] = input_height;
-@@ -501,51 +1128,42 @@ static DNNReturnType get_output_ov(void *model, const char *input_name, int inpu
+@@ -501,51 +1127,42 @@ static DNNReturnType get_output_ov(void *model, const char *input_name, int inpu
          ie_network_input_shapes_free(&input_shapes);
          if (status != OK) {
              av_log(ctx, AV_LOG_ERROR, "Failed to reshape input size for %s\n", input_name);
@@ -1764,7 +1763,7 @@ index 9a47d74c15..393f5bf732 100644
      return ret;
  }
  
-@@ -554,7 +1172,15 @@ DNNModel *ff_dnn_load_model_ov(const char *model_filename, DNNFunctionType func_
+@@ -554,7 +1171,15 @@ DNNModel *ff_dnn_load_model_ov(const char *model_filename, DNNFunctionType func_
      DNNModel *model = NULL;
      OVModel *ov_model = NULL;
      OVContext *ctx = NULL;
@@ -1780,7 +1779,7 @@ index 9a47d74c15..393f5bf732 100644
  
      model = av_mallocz(sizeof(DNNModel));
      if (!model){
-@@ -578,6 +1204,42 @@ DNNModel *ff_dnn_load_model_ov(const char *model_filename, DNNFunctionType func_
+@@ -578,6 +1203,42 @@ DNNModel *ff_dnn_load_model_ov(const char *model_filename, DNNFunctionType func_
          goto err;
      }
  
@@ -1823,7 +1822,7 @@ index 9a47d74c15..393f5bf732 100644
      status = ie_core_create("", &ov_model->core);
      if (status != OK)
          goto err;
-@@ -593,6 +1255,37 @@ DNNModel *ff_dnn_load_model_ov(const char *model_filename, DNNFunctionType func_
+@@ -593,6 +1254,37 @@ DNNModel *ff_dnn_load_model_ov(const char *model_filename, DNNFunctionType func_
          goto err;
      }
  
@@ -1861,7 +1860,7 @@ index 9a47d74c15..393f5bf732 100644
      model->get_input = &get_input_ov;
      model->get_output = &get_output_ov;
      model->options = options;
-@@ -606,209 +1299,138 @@ err:
+@@ -606,209 +1298,138 @@ err:
      return NULL;
  }
  
@@ -2188,14 +2187,12 @@ index 02e532fc1b..03a0761159 100644
          dnn_module->free_model = &ff_dnn_free_model_ov;
      #else
 diff --git a/libavfilter/dnn/dnn_io_proc.c b/libavfilter/dnn/dnn_io_proc.c
-index e104cc5064..daad5dd7b8 100644
+index e104cc5064..55242c2f8a 100644
 --- a/libavfilter/dnn/dnn_io_proc.c
 +++ b/libavfilter/dnn/dnn_io_proc.c
-@@ -22,14 +22,61 @@
- #include "libavutil/imgutils.h"
+@@ -23,13 +23,59 @@
  #include "libswscale/swscale.h"
  #include "libavutil/avassert.h"
-+#include "libavutil/detection_bbox.h"
  
 -DNNReturnType ff_proc_from_dnn_to_frame(AVFrame *frame, DNNData *output, void *log_ctx)
 +static int get_datatype_size(DNNDataType dt)
@@ -2257,7 +2254,7 @@ index e104cc5064..daad5dd7b8 100644
      }
  
      switch (frame->format) {
-@@ -37,7 +84,7 @@ DNNReturnType ff_proc_from_dnn_to_frame(AVFrame *frame, DNNData *output, void *l
+@@ -37,7 +83,7 @@ DNNReturnType ff_proc_from_dnn_to_frame(AVFrame *frame, DNNData *output, void *l
      case AV_PIX_FMT_BGR24:
          sws_ctx = sws_getContext(frame->width * 3,
                                   frame->height,
@@ -2266,7 +2263,7 @@ index e104cc5064..daad5dd7b8 100644
                                   frame->width * 3,
                                   frame->height,
                                   AV_PIX_FMT_GRAY8,
-@@ -45,20 +92,54 @@ DNNReturnType ff_proc_from_dnn_to_frame(AVFrame *frame, DNNData *output, void *l
+@@ -45,20 +91,54 @@ DNNReturnType ff_proc_from_dnn_to_frame(AVFrame *frame, DNNData *output, void *l
          if (!sws_ctx) {
              av_log(log_ctx, AV_LOG_ERROR, "Impossible to create scale context for the conversion "
                  "fmt:%s s:%dx%d -> fmt:%s s:%dx%d\n",
@@ -2327,7 +2324,7 @@ index e104cc5064..daad5dd7b8 100644
      case AV_PIX_FMT_YUV420P:
      case AV_PIX_FMT_YUV422P:
      case AV_PIX_FMT_YUV444P:
-@@ -76,53 +157,122 @@ DNNReturnType ff_proc_from_dnn_to_frame(AVFrame *frame, DNNData *output, void *l
+@@ -76,53 +156,122 @@ DNNReturnType ff_proc_from_dnn_to_frame(AVFrame *frame, DNNData *output, void *l
          if (!sws_ctx) {
              av_log(log_ctx, AV_LOG_ERROR, "Impossible to create scale context for the conversion "
                  "fmt:%s s:%dx%d -> fmt:%s s:%dx%d\n",
@@ -2467,7 +2464,7 @@ index e104cc5064..daad5dd7b8 100644
          sws_freeContext(sws_ctx);
          break;
      case AV_PIX_FMT_GRAYF32:
-@@ -142,78 +292,46 @@ static DNNReturnType proc_from_frame_to_dnn_frameprocessing(AVFrame *frame, DNND
+@@ -142,78 +291,46 @@ static DNNReturnType proc_from_frame_to_dnn_frameprocessing(AVFrame *frame, DNND
                                   AV_PIX_FMT_GRAY8,
                                   frame->width,
                                   frame->height,
