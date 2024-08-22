@@ -1,6 +1,6 @@
-From 8f308d7701e39d80f80584a06cd93bc934940a3a Mon Sep 17 00:00:00 2001
+From 0281583e98fa8f192bb493906816ec11cd47a174 Mon Sep 17 00:00:00 2001
 From: sstate0818 <jie.tian@intel.com>
-Date: Fri, 21 Jun 2024 21:58:05 +0800
+Date: Thu, 22 Aug 2024 13:54:27 +0800
 Subject: [PATCH] IVTAL ffmpeg5.0 release/2.0
 
 ---
@@ -21,7 +21,7 @@ Subject: [PATCH] IVTAL ffmpeg5.0 release/2.0
  libavcodec/hevc_refs.c                 |   7 +
  libavcodec/hevcdec.c                   | 196 ++++++
  libavcodec/libx264.c                   |  12 +
- libavcodec/libx265.c                   |  12 +
+ libavcodec/libx265.c                   |  22 +
  libavcodec/mpegutils.c                 |   2 +
  libavcodec/options_table.h             |   8 +
  libavcodec/pthread_frame.c             |   1 +
@@ -32,7 +32,7 @@ Subject: [PATCH] IVTAL ffmpeg5.0 release/2.0
  libavfilter/dnn_interface.h            |  19 +-
  libavutil/frame.c                      |   2 +
  libavutil/frame.h                      |  76 ++
- 28 files changed, 1738 insertions(+), 216 deletions(-)
+ 28 files changed, 1748 insertions(+), 216 deletions(-)
 
 diff --git a/configure b/configure
 index b2fd26e710..545a428f69 100755
@@ -1049,18 +1049,28 @@ index c5e0231b12..7dd770fd41 100644
      if (!x4->enc)
          return AVERROR_EXTERNAL;
 diff --git a/libavcodec/libx265.c b/libavcodec/libx265.c
-index 851f099343..076cecddfe 100644
+index 851f099343..ecaf752a64 100644
 --- a/libavcodec/libx265.c
 +++ b/libavcodec/libx265.c
-@@ -400,6 +400,17 @@ static av_cold int libx265_encode_init(AVCodecContext *avctx)
+@@ -400,6 +400,27 @@ static av_cold int libx265_encode_init(AVCodecContext *avctx)
          }
      }
  
 +    if(avctx->i_use_remv)
 +    {
 +        if( avctx->myFrame != NULL )
-+            x265_param_default_preset_mvreuse(ctx->params, ctx->preset, avctx->i_use_remv, avctx->myFrame->num_reorder_frames, avctx->myFrame->ref_max_h265,
-+            avctx->myFrame->weighted_pred, avctx->myFrame->weighted_bipred_flag, avctx->myFrame->in_width, avctx->myFrame->in_height);
++        {
++            if (ctx->preset)
++            {
++                x265_param_default_preset_mvreuse(ctx->params, ctx->preset, avctx->i_use_remv, avctx->myFrame->num_reorder_frames, avctx->myFrame->ref_max_h265,
++                avctx->myFrame->weighted_pred, avctx->myFrame->weighted_bipred_flag, avctx->myFrame->in_width, avctx->myFrame->in_height);
++            }
++            else
++            {
++                x265_param_default_preset_mvreuse(ctx->params, "medium", avctx->i_use_remv, avctx->myFrame->num_reorder_frames, avctx->myFrame->ref_max_h265,
++                avctx->myFrame->weighted_pred, avctx->myFrame->weighted_bipred_flag, avctx->myFrame->in_width, avctx->myFrame->in_height);
++            }
++        }
 +        if( avctx->myFrame == NULL && avctx->i_use_remv == 4 )
 +            x265_param_default_preset_mvreuse4(ctx->params);
 +    }
@@ -1070,7 +1080,7 @@ index 851f099343..076cecddfe 100644
      ctx->encoder = ctx->api->encoder_open(ctx->params);
      if (!ctx->encoder) {
          av_log(avctx, AV_LOG_ERROR, "Cannot open libx265 encoder.\n");
-@@ -522,6 +533,7 @@ static int libx265_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
+@@ -522,6 +543,7 @@ static int libx265_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
          }
  
          x265pic.pts      = pic->pts;
