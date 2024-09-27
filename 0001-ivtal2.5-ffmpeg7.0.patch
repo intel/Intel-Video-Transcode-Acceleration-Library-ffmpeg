@@ -1,0 +1,1328 @@
+From 82379c392094a22421d823748435ac52199f5d4b Mon Sep 17 00:00:00 2001
+From: "Zhang, Zheyuan" <zheyuan.zhang@intel.com>
+Date: Thu, 26 Sep 2024 15:57:04 -0400
+Subject: [PATCH] IVTAL 2.5
+
+---
+ fftools/cmdutils.c                     |  51 +++++-
+ fftools/ffmpeg.c                       |   2 +
+ fftools/ffmpeg.h                       |   2 +
+ fftools/ffmpeg_enc.c                   |   9 +
+ fftools/ffmpeg_filter.c                |  50 ++++++
+ fftools/ffmpeg_mux_init.c              |   3 +
+ fftools/ffmpeg_opt.c                   |  34 ++++
+ libavcodec/avcodec.h                   |  12 ++
+ libavcodec/h264_cabac.c                |  77 ++++++++
+ libavcodec/h264_cavlc.c                |  77 ++++++++
+ libavcodec/h264_mvpred.h               |  24 +++
+ libavcodec/h264_ps.c                   |   2 +
+ libavcodec/h264_ps.h                   |   2 +
+ libavcodec/h264_slice.c                |   8 +
+ libavcodec/h264dec.c                   |  39 ++++
+ libavcodec/h264dec.h                   |   1 +
+ libavcodec/hevc_refs.c                 |   7 +
+ libavcodec/hevcdec.c                   | 239 +++++++++++++++++++++++++
+ libavcodec/internal.h                  |   1 +
+ libavcodec/libx264.c                   |  14 ++
+ libavcodec/libx265.c                   |  23 +++
+ libavcodec/mpegutils.c                 |   2 +
+ libavcodec/options_table.h             |   8 +
+ libavcodec/pthread_frame.c             |   4 +
+ libavfilter/dnn/dnn_backend_openvino.c |  17 ++
+ libavutil/frame.c                      |   2 +
+ libavutil/frame.h                      |  76 ++++++++
+ 27 files changed, 785 insertions(+), 1 deletion(-)
+
+diff --git a/fftools/cmdutils.c b/fftools/cmdutils.c
+index 309ec4d32f..2893e08de9 100644
+--- a/fftools/cmdutils.c
++++ b/fftools/cmdutils.c
+@@ -58,7 +58,8 @@
+ 
+ AVDictionary *sws_dict;
+ AVDictionary *swr_opts;
+-AVDictionary *format_opts, *codec_opts;
++AVDictionary *format_opts, *codec_opts, *resample_opts, *input_codec_opts;
++char char_scale_width[5], char_scale_height[5];
+ 
+ int hide_banner = 0;
+ 
+@@ -846,6 +847,16 @@ do {                                                                           \
+                 arg = "1";
+             }
+ 
++            if (!strcmp(opt, "vf"))
++            {
++                int width, height;
++                sscanf(arg, "scale=%d:%d", &width, &height);
++                sprintf(char_scale_width, "%d", width);
++                sprintf(char_scale_height, "%d", height);
++                av_dict_set(&input_codec_opts, "scale_width", char_scale_width, 0);
++                av_dict_set(&input_codec_opts, "scale_height", char_scale_height, 0);
++            }
++
+             ret = add_opt(octx, po, opt, arg);
+             if (ret < 0)
+                 return ret;
+@@ -855,6 +866,34 @@ do {                                                                           \
+             continue;
+         }
+ 
++        if (argv[optindex] && (!strcmp(opt, "preset")))
++            av_dict_set(&input_codec_opts, opt, argv[optindex], 0);
++
++        if (argv[optindex] && (!strcmp(opt, "tune")))
++            av_dict_set(&input_codec_opts, opt, argv[optindex], 0);
++
++        if (argv[optindex] && (!strcmp(opt, "x265-params")))
++        {
++            char *x265_opts = argv[optindex];
++            char *key = NULL;
++            char *val = NULL;
++            char **buf = &x265_opts;
++            while (*x265_opts) {
++                key = av_get_token(buf, "=");
++                if (key && *key && strspn(x265_opts, "=")) {
++                    x265_opts++;
++                    val = av_get_token(buf, ":");
++                }
++                if (*x265_opts)
++                    x265_opts++;
++                if (!strcmp(key, "bframes"))
++                {
++                    av_dict_set(&input_codec_opts, key, val, 0);
++                    break;
++                }
++            }
++        }
++
+         /* AVOptions */
+         if (argv[optindex]) {
+             ret = opt_default(NULL, opt, argv[optindex]);
+@@ -887,6 +926,16 @@ do {                                                                           \
+         return AVERROR_OPTION_NOT_FOUND;
+     }
+ 
++    if (input_codec_opts && octx && octx->nb_groups >= 2)
++    {
++        OptionGroupList *l = &octx->groups[1];
++        for (int i = 0; i < l->nb_groups; i++) {
++            OptionGroup *g = &l->groups[i];
++            g->codec_opts = input_codec_opts;
++        }
++        input_codec_opts = NULL;
++    }
++
+     if (octx->cur_group.nb_opts || codec_opts || format_opts)
+         av_log(NULL, AV_LOG_WARNING, "Trailing option(s) found in the "
+                "command: may be ignored.\n");
+diff --git a/fftools/ffmpeg.c b/fftools/ffmpeg.c
+index 4a0c7d5c4d..2a36da6fd8 100644
+--- a/fftools/ffmpeg.c
++++ b/fftools/ffmpeg.c
+@@ -128,6 +128,8 @@ int        nb_input_files   = 0;
+ OutputFile   **output_files   = NULL;
+ int         nb_output_files   = 0;
+ 
++int         nb_output_video_streams = 0;
++
+ FilterGraph **filtergraphs;
+ int        nb_filtergraphs;
+ 
+diff --git a/fftools/ffmpeg.h b/fftools/ffmpeg.h
+index 6394cca1e7..cebd8b2b12 100644
+--- a/fftools/ffmpeg.h
++++ b/fftools/ffmpeg.h
+@@ -618,6 +618,8 @@ extern int        nb_input_files;
+ extern OutputFile   **output_files;
+ extern int         nb_output_files;
+ 
++extern int         nb_output_video_streams;
++
+ extern FilterGraph **filtergraphs;
+ extern int        nb_filtergraphs;
+ 
+diff --git a/fftools/ffmpeg_enc.c b/fftools/ffmpeg_enc.c
+index 447f133137..656b793eac 100644
+--- a/fftools/ffmpeg_enc.c
++++ b/fftools/ffmpeg_enc.c
+@@ -332,6 +332,9 @@ int enc_open(void *opaque, const AVFrame *frame)
+         return ret;
+     }
+ 
++    if (ost->enc_ctx->codec_type == AVMEDIA_TYPE_VIDEO)
++        ost->enc_ctx->myFrame = frame->myFrame;//should be a global myframe buf
++
+     if ((ret = avcodec_open2(ost->enc_ctx, enc, &ost->encoder_opts)) < 0) {
+         if (ret != AVERROR_EXPERIMENTAL)
+             av_log(ost, AV_LOG_ERROR, "Error while opening encoder - maybe "
+@@ -820,6 +823,12 @@ static int frame_encode(OutputStream *ost, AVFrame *frame, AVPacket *pkt)
+         if (!check_recording_time(ost, frame->pts, frame->time_base))
+             return AVERROR_EOF;
+ 
++        if (ost->enc_ctx->i_use_remv && frame->myFrame)
++        {
++            frame->myFrame->output_stream_count = 0;
++            frame->myFrame->output_stream_num = nb_output_video_streams;
++        }
++
+         if (type == AVMEDIA_TYPE_VIDEO) {
+             frame->quality   = ost->enc_ctx->global_quality;
+             frame->pict_type = forced_kf_apply(ost, &ost->kf, frame);
+diff --git a/fftools/ffmpeg_filter.c b/fftools/ffmpeg_filter.c
+index 171e47be9e..a027d3fb2a 100644
+--- a/fftools/ffmpeg_filter.c
++++ b/fftools/ffmpeg_filter.c
+@@ -2165,6 +2165,13 @@ finish:
+ 
+     fps->last_dropped = *nb_frames == *nb_frames_prev && frame;
+     fps->dropped_keyframe |= fps->last_dropped && (frame->flags & AV_FRAME_FLAG_KEY);
++
++    if( (ost->enc_ctx->i_use_remv||ost->enc_ctx->i_jnd_decqp) && *nb_frames == 0 && frame )
++    {
++        frame->myFrame->output_stream_drop_count++;
++        if ( frame->myFrame->output_stream_drop_count == nb_output_video_streams )
++            free( frame->myFrame );
++    }
+ }
+ 
+ static int close_output(OutputFilterPriv *ofp, FilterGraphThread *fgt)
+@@ -2223,6 +2230,8 @@ static int fg_output_frame(OutputFilterPriv *ofp, FilterGraphThread *fgt,
+     FilterGraphPriv  *fgp = fgp_from_fg(ofp->ofilter.graph);
+     AVFrame   *frame_prev = ofp->fps.last_frame;
+     enum AVMediaType type = ofp->ofilter.type;
++    int next_duplicate = 0;
++    int dup_frame_mode = 1;
+ 
+     int64_t nb_frames = !!frame, nb_frames_prev = 0;
+ 
+@@ -2236,6 +2245,47 @@ static int fg_output_frame(OutputFilterPriv *ofp, FilterGraphThread *fgt,
+         if (type == AVMEDIA_TYPE_VIDEO) {
+             AVFrame *frame_in = (i < nb_frames_prev && frame_prev->buf[0]) ?
+                                 frame_prev : frame;
++
++            if (i < nb_frames_prev && frame_prev->buf[0]) {
++                if(( frame_in->myFrame != NULL ) && ( ofp->ofilter.ost->enc_ctx->i_use_remv||ofp->ofilter.ost->enc_ctx->i_jnd_decqp ))
++                {
++                    if( frame_in->myFrame->is_dup_frame == 0 )
++                        dup_frame_mode = frame_in->myFrame->num_reorder_frames > 0;
++                    else
++                        dup_frame_mode = frame_in->myFrame->is_dup_frame!=1;
++                    frame_in->myFrame = (FrameReuse*)malloc(sizeof(FrameReuse));
++                    frame_in->myFrame->i_frame = -1; //dup frame
++                    if( dup_frame_mode )
++                    {
++                        frame_in->myFrame->is_dup_frame = 2;
++                        frame_in->myFrame->i_frame_type = (nb_frames > 16)?2:3;
++                    }
++                    else
++                        frame_in->myFrame->is_dup_frame = 1;
++                }
++            } else
++            {
++                if(( frame_in->myFrame != NULL ) && ( ofp->ofilter.ost->enc_ctx->i_use_remv||ofp->ofilter.ost->enc_ctx->i_jnd_decqp ))
++                {
++                    if(next_duplicate++)
++                    {
++                        if( frame_in->myFrame->is_dup_frame == 0 )
++                            dup_frame_mode = frame_in->myFrame->num_reorder_frames > 0;
++                        else
++                            dup_frame_mode = frame_in->myFrame->is_dup_frame!=1;
++                        frame_in->myFrame = (FrameReuse*)malloc(sizeof(FrameReuse));
++                        frame_in->myFrame->i_frame = -1; //dup frame
++                        if( dup_frame_mode )
++                        {
++                            frame_in->myFrame->is_dup_frame = 2;
++                            frame_in->myFrame->i_frame_type = (nb_frames > 16)?2:3;
++                        }
++                        else
++                            frame_in->myFrame->is_dup_frame = 1;
++                    }
++                }
++            }
++
+             if (!frame_in)
+                 break;
+ 
+diff --git a/fftools/ffmpeg_mux_init.c b/fftools/ffmpeg_mux_init.c
+index d3d7d022ff..48f2c226df 100644
+--- a/fftools/ffmpeg_mux_init.c
++++ b/fftools/ffmpeg_mux_init.c
+@@ -1050,6 +1050,9 @@ static int ost_add(Muxer *mux, const OptionsContext *o, enum AVMediaType type,
+     if (!st)
+         return AVERROR(ENOMEM);
+ 
++    if (type == AVMEDIA_TYPE_VIDEO)
++        nb_output_video_streams++;
++
+     ms  = mux_stream_alloc(mux, type);
+     if (!ms)
+         return AVERROR(ENOMEM);
+diff --git a/fftools/ffmpeg_opt.c b/fftools/ffmpeg_opt.c
+index 4b3f9789ba..0b324ab87b 100644
+--- a/fftools/ffmpeg_opt.c
++++ b/fftools/ffmpeg_opt.c
+@@ -92,6 +92,10 @@ int ignore_unknown_streams = 0;
+ int copy_unknown_streams = 0;
+ int recast_media = 0;
+ 
++static int cmd_i_use_remv      = 0;
++static int cmd_i_use_remv_fref = 0;
++static int cmd_i_jnd_decqp    = 0;
++
+ static void uninit_options(OptionsContext *o)
+ {
+     int i;
+@@ -1201,6 +1205,27 @@ static int open_files(OptionGroupList *l, const char *inout, Scheduler *sch,
+         init_options(&o);
+         o.g = g;
+ 
++        if( cmd_i_use_remv > 0 )
++        {
++            char cmd_us_use_remv[2];
++            sprintf(cmd_us_use_remv, "%d", cmd_i_use_remv);
++            av_dict_set(&((&o)->g->codec_opts), "mvreuse", cmd_us_use_remv, 0);
++        }
++
++        if( cmd_i_use_remv_fref > 0 )
++        {
++            char cmd_us_use_remv_fref[2];
++            sprintf(cmd_us_use_remv_fref, "%d", cmd_i_use_remv_fref);
++            av_dict_set(&((&o)->g->codec_opts), "mvreuse-fref", cmd_us_use_remv_fref, 0);
++        }
++
++        if( cmd_i_jnd_decqp > 0 )
++        {
++            char cmd_us_cdef_decqp[2];
++            sprintf(cmd_us_cdef_decqp, "%d", cmd_i_jnd_decqp);
++            av_dict_set(&((&o)->g->codec_opts), "jnd-decqp", cmd_us_cdef_decqp, 0);
++        }
++
+         ret = parse_optgroup(&o, g, options);
+         if (ret < 0) {
+             av_log(NULL, AV_LOG_ERROR, "Error parsing options for %s file "
+@@ -1741,6 +1766,15 @@ const OptionDef options[] = {
+     { "autoscale",                  OPT_TYPE_BOOL,   OPT_PERSTREAM | OPT_EXPERT | OPT_OUTPUT,
+         { .off = OFFSET(autoscale) },
+         "automatically insert a scale filter at the end of the filter graph" },
++    { "mvreuse",          OPT_TYPE_INT, 0,
++        { &cmd_i_use_remv },
++        "MVReuse strategy (0:close 1:gain 2:fast 3:balance 4:custom)", "number" },
++    { "mvreuse-fref",     OPT_TYPE_INT, 0,
++        { &cmd_i_use_remv_fref },
++        "Force ref num while MVReuse", "number" },
++    { "jnd-decqp",        OPT_TYPE_INT, 0,
++        { &cmd_i_jnd_decqp },
++        "Adaptive CDEF by decode qp", "number" },
+     { "fix_sub_duration_heartbeat", OPT_TYPE_BOOL,   OPT_VIDEO | OPT_EXPERT | OPT_PERSTREAM | OPT_OUTPUT,
+         { .off = OFFSET(fix_sub_duration_heartbeat) },
+         "set this video output stream to be a heartbeat stream for "
+diff --git a/libavcodec/avcodec.h b/libavcodec/avcodec.h
+index 83dc487251..01a8ab8eca 100644
+--- a/libavcodec/avcodec.h
++++ b/libavcodec/avcodec.h
+@@ -2075,6 +2075,18 @@ typedef struct AVCodecContext {
+      */
+     AVFrameSideData  **decoded_side_data;
+     int             nb_decoded_side_data;
++
++    // /* MVReuse info */
++    int i_input_number;
++    FrameReuse *myFrame;
++    int i_use_remv;
++    int i_use_remv_fref;
++    int i_jnd_decqp;
++    int i_scale_width;
++    int i_scale_height;
++    char* preset;
++    char* tune;
++    int bframes;
+ } AVCodecContext;
+ 
+ /**
+diff --git a/libavcodec/h264_cabac.c b/libavcodec/h264_cabac.c
+index 703b27aa96..709d8ef41b 100644
+--- a/libavcodec/h264_cabac.c
++++ b/libavcodec/h264_cabac.c
+@@ -2331,6 +2331,77 @@ decode_intra_mb:
+         write_back_motion(h, sl, mb_type);
+    }
+ 
++   if(h->avctx->i_use_remv == 2 || h->avctx->i_use_remv == 3 || h->avctx->i_use_remv == 4)
++   {
++        int i, direction;
++        MVReuse *myMb = &(h->cur_pic_ptr->f->myFrame->myMb[sl->mb_x][sl->mb_y]);
++        int direction_max = ((h->cur_pic.f->pict_type==AV_PICTURE_TYPE_P)?1:2);
++        const int b_stride      = h->b_stride;
++        const int b_xy  = 4 * sl->mb_x + 4 * sl->mb_y * h->b_stride; // try mb2b(8)_xy
++        const int b8_xy = 4 * sl->mb_xy;
++        for (direction = 0; direction < direction_max; direction++) {
++            if (IS_8X8(mb_type)) {
++                myMb->i_type = 5;
++                myMb->i_part = 13;
++                for (i = 0; i < 4; i++) {
++                    // myMb->sub_mb[i].mv[direction][0] = h->cur_pic.motion_val[direction][b_xy+i*b_stride][0];
++                    // myMb->sub_mb[i].mv[direction][1] = h->cur_pic.motion_val[direction][b_xy+i*b_stride][1];
++                    int ref = h->cur_pic.ref_index[direction][b8_xy+i];
++                    myMb->sub_mb[i].i_ref[direction] = (ref==-1)?0:ref;
++                }
++                myMb->sub_mb[0].mv[direction][0] = h->cur_pic.motion_val[direction][b_xy][0];
++                myMb->sub_mb[0].mv[direction][1] = h->cur_pic.motion_val[direction][b_xy][1];
++                myMb->sub_mb[1].mv[direction][0] = h->cur_pic.motion_val[direction][b_xy+2][0];
++                myMb->sub_mb[1].mv[direction][1] = h->cur_pic.motion_val[direction][b_xy+2][1];
++                myMb->sub_mb[2].mv[direction][0] = h->cur_pic.motion_val[direction][b_xy+2*b_stride][0];
++                myMb->sub_mb[2].mv[direction][1] = h->cur_pic.motion_val[direction][b_xy+2*b_stride][1];
++                myMb->sub_mb[3].mv[direction][0] = h->cur_pic.motion_val[direction][b_xy+2*b_stride+2][0];
++                myMb->sub_mb[3].mv[direction][1] = h->cur_pic.motion_val[direction][b_xy+2*b_stride+2][1];
++            }
++            else if (IS_16X8(mb_type)) {
++                myMb->i_type = 4;
++                myMb->i_part = 14;
++                for (i = 0; i < 2; i++) {
++                    // myMb->sub_mb[i].mv[direction][0] = h->cur_pic.motion_val[direction][b_xy+i*b_stride][0];
++                    // myMb->sub_mb[i].mv[direction][1] = h->cur_pic.motion_val[direction][b_xy+i*b_stride][1];
++                    myMb->sub_mb[i].mv[direction][0] = h->cur_pic.motion_val[direction][b_xy+2*i*b_stride][0];
++                    myMb->sub_mb[i].mv[direction][1] = h->cur_pic.motion_val[direction][b_xy+2*i*b_stride][1];
++                    int ref = h->cur_pic.ref_index[direction][b8_xy+(i*2)];
++                    myMb->sub_mb[i].i_ref[direction] = (ref==-1)?0:ref;
++                    if (IS_INTERLACED(mb_type))
++                        myMb->sub_mb[i].mv[direction][1]*=2;
++                }
++            }
++            else if (IS_8X16(mb_type)) {
++                myMb->i_type = 4;
++                myMb->i_part = 15;
++                for (i = 0; i < 2; i++) {
++                    // myMb->sub_mb[i].mv[direction][0] = h->cur_pic.motion_val[direction][b_xy+i*b_stride][0];
++                    // myMb->sub_mb[i].mv[direction][1] = h->cur_pic.motion_val[direction][b_xy+i*b_stride][1];
++                    myMb->sub_mb[i].mv[direction][0] = h->cur_pic.motion_val[direction][b_xy+2*i][0];
++                    myMb->sub_mb[i].mv[direction][1] = h->cur_pic.motion_val[direction][b_xy+2*i][1];
++                    int ref = h->cur_pic.ref_index[direction][b8_xy+(i*2)];
++                    myMb->sub_mb[i].i_ref[direction] = (ref==-1)?0:ref;
++                    if (IS_INTERLACED(mb_type))
++                        myMb->sub_mb[i].mv[direction][1]*=2;
++                }
++            }
++            else if (IS_16X16(mb_type)) {
++                myMb->i_type = 4;
++                myMb->i_part = 16;
++                myMb->sub_mb[0].mv[direction][0] = h->cur_pic.motion_val[direction][b_xy][0];
++                myMb->sub_mb[0].mv[direction][1] = h->cur_pic.motion_val[direction][b_xy][1];
++                int ref = h->cur_pic.ref_index[direction][b8_xy];
++                myMb->sub_mb[0].i_ref[direction] = (ref==-1)?0:ref;
++            }
++            else
++            {
++                myMb->i_type = 0;
++                myMb->i_part = 0;
++            }
++        }
++    }
++
+     if( !IS_INTRA16x16( mb_type ) ) {
+         cbp  = decode_cabac_mb_cbp_luma(sl);
+         if(decode_chroma)
+@@ -2495,5 +2566,11 @@ decode_intra_mb:
+     h->cur_pic.qscale_table[mb_xy] = sl->qscale;
+     write_back_non_zero_count(h, sl);
+ 
++    if(h->avctx->i_jnd_decqp || h->avctx->i_use_remv)
++    {
++        h->cur_pic_ptr->f->myFrame->myMb[sl->mb_x][sl->mb_y].i_skip_qp_get_flag = 1;//non-skip qp get flag
++        h->cur_pic_ptr->f->myFrame->myMb[sl->mb_x][sl->mb_y].i_qp_aq = sl->qscale;
++    }
++
+     return 0;
+ }
+diff --git a/libavcodec/h264_cavlc.c b/libavcodec/h264_cavlc.c
+index 75e5fb7483..97b289c5d8 100644
+--- a/libavcodec/h264_cavlc.c
++++ b/libavcodec/h264_cavlc.c
+@@ -1029,6 +1029,77 @@ decode_intra_mb:
+     if(IS_INTER(mb_type))
+         write_back_motion(h, sl, mb_type);
+ 
++    if(h->avctx->i_use_remv == 2 || h->avctx->i_use_remv == 3 || h->avctx->i_use_remv == 4)
++    {
++        int i, direction;
++        MVReuse *myMb = &(h->cur_pic_ptr->f->myFrame->myMb[sl->mb_x][sl->mb_y]);
++        int direction_max = ((h->cur_pic.f->pict_type==AV_PICTURE_TYPE_P)?1:2);
++        const int b_stride      = h->b_stride;
++        const int b_xy  = 4 * sl->mb_x + 4 * sl->mb_y * h->b_stride; // try mb2b(8)_xy
++        const int b8_xy = 4 * sl->mb_xy;
++        for (direction = 0; direction < direction_max; direction++) {
++            if (IS_8X8(mb_type)) {
++                myMb->i_type = 5;
++                myMb->i_part = 13;
++                for (i = 0; i < 4; i++) {
++                    // myMb->sub_mb[i].mv[direction][0] = h->cur_pic.motion_val[direction][b_xy+i*b_stride][0];
++                    // myMb->sub_mb[i].mv[direction][1] = h->cur_pic.motion_val[direction][b_xy+i*b_stride][1];
++                    int ref = h->cur_pic.ref_index[direction][b8_xy+i];
++                    myMb->sub_mb[i].i_ref[direction] = (ref==-1)?0:ref;
++                }
++                myMb->sub_mb[0].mv[direction][0] = h->cur_pic.motion_val[direction][b_xy][0];
++                myMb->sub_mb[0].mv[direction][1] = h->cur_pic.motion_val[direction][b_xy][1];
++                myMb->sub_mb[1].mv[direction][0] = h->cur_pic.motion_val[direction][b_xy+2][0];
++                myMb->sub_mb[1].mv[direction][1] = h->cur_pic.motion_val[direction][b_xy+2][1];
++                myMb->sub_mb[2].mv[direction][0] = h->cur_pic.motion_val[direction][b_xy+2*b_stride][0];
++                myMb->sub_mb[2].mv[direction][1] = h->cur_pic.motion_val[direction][b_xy+2*b_stride][1];
++                myMb->sub_mb[3].mv[direction][0] = h->cur_pic.motion_val[direction][b_xy+2*b_stride+2][0];
++                myMb->sub_mb[3].mv[direction][1] = h->cur_pic.motion_val[direction][b_xy+2*b_stride+2][1];
++            }
++            else if (IS_16X8(mb_type)) {
++                myMb->i_type = 4;
++                myMb->i_part = 14;
++                for (i = 0; i < 2; i++) {
++                    // myMb->sub_mb[i].mv[direction][0] = h->cur_pic.motion_val[direction][b_xy+i*b_stride][0];
++                    // myMb->sub_mb[i].mv[direction][1] = h->cur_pic.motion_val[direction][b_xy+i*b_stride][1];
++                    myMb->sub_mb[i].mv[direction][0] = h->cur_pic.motion_val[direction][b_xy+2*i*b_stride][0];
++                    myMb->sub_mb[i].mv[direction][1] = h->cur_pic.motion_val[direction][b_xy+2*i*b_stride][1];
++                    int ref = h->cur_pic.ref_index[direction][b8_xy+(i*2)];
++                    myMb->sub_mb[i].i_ref[direction] = (ref==-1)?0:ref;
++                    if (IS_INTERLACED(mb_type))
++                        myMb->sub_mb[i].mv[direction][1]*=2;
++                }
++            }
++            else if (IS_8X16(mb_type)) {
++                myMb->i_type = 4;
++                myMb->i_part = 15;
++                for (i = 0; i < 2; i++) {
++                    // myMb->sub_mb[i].mv[direction][0] = h->cur_pic.motion_val[direction][b_xy+i*b_stride][0];
++                    // myMb->sub_mb[i].mv[direction][1] = h->cur_pic.motion_val[direction][b_xy+i*b_stride][1];
++                    myMb->sub_mb[i].mv[direction][0] = h->cur_pic.motion_val[direction][b_xy+2*i][0];
++                    myMb->sub_mb[i].mv[direction][1] = h->cur_pic.motion_val[direction][b_xy+2*i][1];
++                    int ref = h->cur_pic.ref_index[direction][b8_xy+(i*2)];
++                    myMb->sub_mb[i].i_ref[direction] = (ref==-1)?0:ref;
++                    if (IS_INTERLACED(mb_type))
++                        myMb->sub_mb[i].mv[direction][1]*=2;
++                }
++            }
++            else if (IS_16X16(mb_type)) {
++                myMb->i_type = 4;
++                myMb->i_part = 16;
++                myMb->sub_mb[0].mv[direction][0] = h->cur_pic.motion_val[direction][b_xy][0];
++                myMb->sub_mb[0].mv[direction][1] = h->cur_pic.motion_val[direction][b_xy][1];
++                int ref = h->cur_pic.ref_index[direction][b8_xy];
++                myMb->sub_mb[0].i_ref[direction] = (ref==-1)?0:ref;
++            }
++            else
++            {
++                myMb->i_type = 0;
++                myMb->i_part = 0;
++            }
++        }
++    }
++
+     if(!IS_INTRA16x16(mb_type)){
+         cbp= get_ue_golomb(&sl->gb);
+ 
+@@ -1146,5 +1217,11 @@ decode_intra_mb:
+     h->cur_pic.qscale_table[mb_xy] = sl->qscale;
+     write_back_non_zero_count(h, sl);
+ 
++    if(h->avctx->i_jnd_decqp || h->avctx->i_use_remv)
++    {
++        h->cur_pic_ptr->f->myFrame->myMb[sl->mb_x][sl->mb_y].i_skip_qp_get_flag = 1;//non-skip qp get flag
++        h->cur_pic_ptr->f->myFrame->myMb[sl->mb_x][sl->mb_y].i_qp_aq = sl->qscale;
++    }
++
+     return 0;
+ }
+diff --git a/libavcodec/h264_mvpred.h b/libavcodec/h264_mvpred.h
+index bc9fef50e4..a850368b2d 100644
+--- a/libavcodec/h264_mvpred.h
++++ b/libavcodec/h264_mvpred.h
+@@ -962,6 +962,30 @@ static void av_unused decode_mb_skip(const H264Context *h, H264SliceContext *sl)
+     h->cur_pic.qscale_table[mb_xy] = sl->qscale;
+     h->slice_table[mb_xy]          = sl->slice_num;
+     sl->prev_mb_skipped            = 1;
++
++    if(h->avctx->i_use_remv == 2 || h->avctx->i_use_remv == 3 || h->avctx->i_use_remv == 4) //for skip
++    {
++        int direction;
++        MVReuse *myMb = &(h->cur_pic_ptr->f->myFrame->myMb[sl->mb_x][sl->mb_y]);
++        int direction_max = ((h->cur_pic.f->pict_type==AV_PICTURE_TYPE_P)?1:2);
++        const int b_stride      = h->b_stride;
++        const int b_xy  = 4 * sl->mb_x + 4 * sl->mb_y * h->b_stride; // try mb2b(8)_xy
++        const int b8_xy = 4 * sl->mb_xy;
++        for (direction = 0; direction < direction_max; direction++) {
++            myMb->i_type = 6;
++            myMb->i_part = 16;
++            myMb->sub_mb[0].mv[direction][0] = h->cur_pic.motion_val[direction][b_xy][0];
++            myMb->sub_mb[0].mv[direction][1] = h->cur_pic.motion_val[direction][b_xy][1];
++            int ref = h->cur_pic.ref_index[direction][b8_xy];
++            myMb->sub_mb[0].i_ref[direction] = (ref==-1)?0:ref;
++        }
++    }
++
++    if(h->avctx->i_jnd_decqp || h->avctx->i_use_remv)
++    {
++        h->cur_pic_ptr->f->myFrame->myMb[sl->mb_x][sl->mb_y].i_skip_qp_get_flag = 0;//skip qp get flag
++        h->cur_pic_ptr->f->myFrame->myMb[sl->mb_x][sl->mb_y].i_qp_aq = sl->qscale;//skip qp get
++    }
+ }
+ 
+ #endif /* AVCODEC_H264_MVPRED_H */
+diff --git a/libavcodec/h264_ps.c b/libavcodec/h264_ps.c
+index 3c8fc33c7f..d4489db06d 100644
+--- a/libavcodec/h264_ps.c
++++ b/libavcodec/h264_ps.c
+@@ -321,6 +321,7 @@ int ff_h264_decode_seq_parameter_set(GetBitContext *gb, AVCodecContext *avctx,
+         goto fail;
+     }
+ 
++    ps->sps_id                = sps_id;
+     sps->sps_id               = sps_id;
+     sps->time_offset_length   = 24;
+     sps->profile_idc          = profile_idc;
+@@ -708,6 +709,7 @@ int ff_h264_decode_picture_parameter_set(GetBitContext *gb, AVCodecContext *avct
+         return AVERROR_INVALIDDATA;
+     }
+ 
++    ps->pps_id = pps_id;
+     pps = ff_refstruct_alloc_ext(sizeof(*pps), 0, NULL, pps_free);
+     if (!pps)
+         return AVERROR(ENOMEM);
+diff --git a/libavcodec/h264_ps.h b/libavcodec/h264_ps.h
+index 80af4832fe..6489a9ba5d 100644
+--- a/libavcodec/h264_ps.h
++++ b/libavcodec/h264_ps.h
+@@ -150,6 +150,8 @@ typedef struct H264ParamSets {
+     const SPS *sps; ///< ordinary pointer, no RefStruct reference
+ 
+     int overread_warning_printed[2];
++    int sps_id; //get sps for mvreuse
++    int pps_id; //get pps for mvreuse
+ } H264ParamSets;
+ 
+ /**
+diff --git a/libavcodec/h264_slice.c b/libavcodec/h264_slice.c
+index 752735cc54..c576f03504 100644
+--- a/libavcodec/h264_slice.c
++++ b/libavcodec/h264_slice.c
+@@ -243,6 +243,13 @@ static int alloc_picture(H264Context *h, H264Picture *pic)
+     pic->mb_type      = pic->mb_type_base + 2 * h->mb_stride + 1;
+     pic->qscale_table = pic->qscale_table_base + 2 * h->mb_stride + 1;
+ 
++    if( h->avctx->i_use_remv||h->avctx->i_jnd_decqp )
++    {
++        pic->f->myFrame = (FrameReuse*)malloc(sizeof(FrameReuse));
++        pic->f->myFrame->output_stream_drop_count = 0;
++        pic->f->myFrame->is_dup_frame = 0;
++    }
++
+     for (i = 0; i < 2; i++) {
+         pic->motion_val_base[i] = ff_refstruct_pool_get(h->motion_val_pool);
+         pic->ref_index[i]       = ff_refstruct_pool_get(h->ref_index_pool);
+@@ -515,6 +522,7 @@ static int h264_frame_start(H264Context *h)
+     pic->f->crop_right  = h->crop_right;
+     pic->f->crop_top    = h->crop_top;
+     pic->f->crop_bottom = h->crop_bottom;
++    pic->f->bref        = (h->nal_ref_idc==0)?0:1;
+ 
+     pic->needs_fg = h->sei.common.film_grain_characteristics.present && !h->avctx->hwaccel &&
+         !(h->avctx->export_side_data & AV_CODEC_EXPORT_DATA_FILM_GRAIN);
+diff --git a/libavcodec/h264dec.c b/libavcodec/h264dec.c
+index b4973fce29..34f29999d8 100644
+--- a/libavcodec/h264dec.c
++++ b/libavcodec/h264dec.c
+@@ -975,6 +975,45 @@ static int finalize_frame(H264Context *h, AVFrame *dst, H264Picture *out, int *g
+         if (ret < 0)
+             return ret;
+ 
++        if (h->avctx->i_use_remv || h->avctx->i_jnd_decqp) {
++
++            H264ParamSets *ps                  = &(((H264Context*)(h->avctx)->priv_data)->ps);
++            SPS *sps                           = (SPS*)(ps->sps_list[ps->sps->sps_id]);
++            PPS *pps                           = (PPS*)(ps->pps_list[ps->sps->sps_id]);
++            dst->myFrame->i_frame              = h->avctx->i_input_number - h->avctx->has_b_frames;
++            dst->myFrame->num_reorder_frames   = (h->avctx->has_b_frames>0)?1:0;
++            dst->myFrame->ref_max              = sps->ref_frame_count;
++            dst->myFrame->ref_max_h265         = -1;
++            if(sps->num_units_in_tick != 0)
++                dst->myFrame->framerate            = sps->time_scale / sps->num_units_in_tick / 2;
++            dst->myFrame->ref_count[0]         = pps->ref_count[0];
++            dst->myFrame->ref_count[1]         = pps->ref_count[1];
++            dst->myFrame->weighted_pred        = pps->weighted_pred?1:0;
++            if(dst->pict_type == 3)
++                dst->myFrame->i_frame_type    = dst->bref?4:3;
++            else
++                dst->myFrame->i_frame_type    = dst->pict_type;
++            dst->myFrame->in_width            = h->avctx->width;
++            dst->myFrame->in_height           = h->avctx->height;
++            dst->myFrame->is_dup_frame        = 0;
++            dst->myFrame->in_depth            = av_pix_fmt_desc_get(h->avctx->pix_fmt)->comp[0].depth;
++
++            int qp_count = 0;
++            dst->myFrame->i_frame_avg_qp_aq   = 0;
++            for(int i=0;i<sps->mb_width;i++)
++            {
++                for(int j=0;j<sps->mb_height;j++)
++                {
++                    if(dst->myFrame->myMb[i][j].i_skip_qp_get_flag) //non-skip --VCA
++                    {
++                        dst->myFrame->i_frame_avg_qp_aq+=dst->myFrame->myMb[i][j].i_qp_aq;
++                        qp_count++;
++                    }
++                }
++            }
++            dst->myFrame->i_frame_avg_qp_aq/=qp_count;
++        }
++
+         *got_frame = 1;
+ 
+         if (CONFIG_MPEGVIDEODEC) {
+diff --git a/libavcodec/h264dec.h b/libavcodec/h264dec.h
+index 447c2499d9..ca4aea710b 100644
+--- a/libavcodec/h264dec.h
++++ b/libavcodec/h264dec.h
+@@ -156,6 +156,7 @@ typedef struct H264Picture {
+     atomic_int *decode_error_flags;
+ 
+     int gray;
++    FrameReuse *myFrame;
+ } H264Picture;
+ 
+ typedef struct H264Ref {
+diff --git a/libavcodec/hevc_refs.c b/libavcodec/hevc_refs.c
+index 54e3d40e1c..3083dbf656 100644
+--- a/libavcodec/hevc_refs.c
++++ b/libavcodec/hevc_refs.c
+@@ -97,6 +97,13 @@ static HEVCFrame *alloc_frame(HEVCContext *s)
+             goto fail;
+         frame->nb_rpl_elems = s->pkt.nb_nals;
+ 
++        if( s->avctx->i_use_remv||s->avctx->i_jnd_decqp )
++        {
++            frame->frame->myFrame = (FrameReuse*)malloc(sizeof(FrameReuse));
++            frame->frame->myFrame->output_stream_drop_count = 0;
++            frame->frame->myFrame->is_dup_frame = 0;
++        }
++
+         frame->tab_mvf = ff_refstruct_pool_get(s->tab_mvf_pool);
+         if (!frame->tab_mvf)
+             goto fail;
+diff --git a/libavcodec/hevcdec.c b/libavcodec/hevcdec.c
+index 9b3f31c948..16032cad9d 100644
+--- a/libavcodec/hevcdec.c
++++ b/libavcodec/hevcdec.c
+@@ -52,6 +52,10 @@
+ #include "thread.h"
+ #include "threadframe.h"
+ 
++extern int op_ffmpeg_mv_flag(int max_dec_pic_buffering, int max_latency_increase, int i_scale_width, int i_scale_height,
++                        int width, int height, int i_use_remv, int bframes, char* preset, char* tune);
++
++
+ static const uint8_t hevc_pel_weight[65] = { [2] = 0, [4] = 1, [6] = 2, [8] = 3, [12] = 4, [16] = 5, [24] = 6, [32] = 7, [48] = 8, [64] = 9 };
+ 
+ /**
+@@ -1980,6 +1984,13 @@ static void hls_prediction_unit(HEVCLocalContext *lc, int x0, int y0,
+         hevc_await_progress(s, ref1, &current_mv.mv[1], y0, nPbH);
+     }
+ 
++    int mv_flag = 0;
++    if (s->avctx->i_use_remv && s->ps.sps->log2_min_pu_size == 2)
++        mv_flag = op_ffmpeg_mv_flag(s->ps.sps->temporal_layer[s->ps.sps->max_sub_layers -1].max_dec_pic_buffering,
++                                    s->ps.sps->temporal_layer[s->ps.sps->max_sub_layers -1].max_latency_increase,
++                                    s->avctx->i_scale_width, s->avctx->i_scale_height, s->avctx->width, s->avctx->height,
++                                    s->avctx->i_use_remv, s->avctx->bframes, s->avctx->preset, s->avctx->tune);
++
+     if (current_mv.pred_flag == PF_L0) {
+         int x0_c = x0 >> s->ps.sps->hshift[1];
+         int y0_c = y0 >> s->ps.sps->vshift[1];
+@@ -1999,6 +2010,28 @@ static void hls_prediction_unit(HEVCLocalContext *lc, int x0, int y0,
+                           0, x0_c, y0_c, nPbW_c, nPbH_c, &current_mv,
+                           s->sh.chroma_weight_l0[current_mv.ref_idx[0]][1], s->sh.chroma_offset_l0[current_mv.ref_idx[0]][1]);
+         }
++
++        if (mv_flag)
++        {
++            x265_MVReuse *x265_myPu = NULL;
++            for (int j = 0; j < nPbH >> s->ps.sps->log2_min_pu_size; j++)
++            {
++                for (int i = 0; i < nPbW >> s->ps.sps->log2_min_pu_size; i++)
++                {
++                    x265_myPu = &(s->ref->frame->myFrame->x265_myPu[x_pu + i][y_pu + j]);
++                    x265_myPu->merge_flag = lc->pu.merge_flag;
++                    x265_myPu->pred_flag = current_mv.pred_flag;
++                    x265_myPu->ref_idx[0] = current_mv.ref_idx[0];
++                    x265_myPu->ref_idx[1] = -1;
++                    x265_myPu->ref_poc[0] = ref0->poc;
++                    x265_myPu->ref_poc[1] = -1;
++                    x265_myPu->mv[0][0] = current_mv.mv[0].x;
++                    x265_myPu->mv[0][1] = current_mv.mv[0].y;
++                    x265_myPu->mv[1][0] = 0;
++                    x265_myPu->mv[1][1] = 0;
++                }
++            }
++        }
+     } else if (current_mv.pred_flag == PF_L1) {
+         int x0_c = x0 >> s->ps.sps->hshift[1];
+         int y0_c = y0 >> s->ps.sps->vshift[1];
+@@ -2019,6 +2052,28 @@ static void hls_prediction_unit(HEVCLocalContext *lc, int x0, int y0,
+                           1, x0_c, y0_c, nPbW_c, nPbH_c, &current_mv,
+                           s->sh.chroma_weight_l1[current_mv.ref_idx[1]][1], s->sh.chroma_offset_l1[current_mv.ref_idx[1]][1]);
+         }
++
++        if (mv_flag)
++        {
++            x265_MVReuse *x265_myPu = NULL;
++            for (int j = 0; j < nPbH >> s->ps.sps->log2_min_pu_size; j++)
++            {
++                for (int i = 0; i < nPbW >> s->ps.sps->log2_min_pu_size; i++)
++                {
++                    x265_myPu = &(s->ref->frame->myFrame->x265_myPu[x_pu + i][y_pu + j]);
++                    x265_myPu->merge_flag = lc->pu.merge_flag;
++                    x265_myPu->pred_flag = current_mv.pred_flag;
++                    x265_myPu->ref_idx[0] = -1;
++                    x265_myPu->ref_idx[1] = current_mv.ref_idx[1];
++                    x265_myPu->ref_poc[0] = -1;
++                    x265_myPu->ref_poc[1] = ref1->poc;
++                    x265_myPu->mv[0][0] = 0;
++                    x265_myPu->mv[0][1] = 0;
++                    x265_myPu->mv[1][0] = current_mv.mv[1].x;
++                    x265_myPu->mv[1][1] = current_mv.mv[1].y;
++                }
++            }
++        }
+     } else if (current_mv.pred_flag == PF_BI) {
+         int x0_c = x0 >> s->ps.sps->hshift[1];
+         int y0_c = y0 >> s->ps.sps->vshift[1];
+@@ -2036,6 +2091,28 @@ static void hls_prediction_unit(HEVCLocalContext *lc, int x0, int y0,
+             chroma_mc_bi(lc, dst2, s->frame->linesize[2], ref0->frame, ref1->frame,
+                          x0_c, y0_c, nPbW_c, nPbH_c, &current_mv, 1);
+         }
++
++        if (mv_flag)
++        {
++            x265_MVReuse *x265_myPu = NULL;
++            for (int j = 0; j < nPbH >> s->ps.sps->log2_min_pu_size; j++)
++            {
++                for (int i = 0; i < nPbW >> s->ps.sps->log2_min_pu_size; i++)
++                {
++                    x265_myPu = &(s->ref->frame->myFrame->x265_myPu[x_pu + i][y_pu + j]);
++                    x265_myPu->merge_flag = lc->pu.merge_flag;
++                    x265_myPu->pred_flag = current_mv.pred_flag;
++                    x265_myPu->ref_idx[0] = current_mv.ref_idx[0];
++                    x265_myPu->ref_idx[1] = current_mv.ref_idx[1];
++                    x265_myPu->ref_poc[0] = ref0->poc;
++                    x265_myPu->ref_poc[1] = ref1->poc;
++                    x265_myPu->mv[0][0] = current_mv.mv[0].x;
++                    x265_myPu->mv[0][1] = current_mv.mv[0].y;
++                    x265_myPu->mv[1][0] = current_mv.mv[1].x;
++                    x265_myPu->mv[1][1] = current_mv.mv[1].y;
++                }
++            }
++        }
+     }
+ }
+ 
+@@ -2275,12 +2352,41 @@ static int hls_coding_unit(HEVCLocalContext *lc, const HEVCContext *s, int x0, i
+         }
+     }
+ 
++    int x_pu, y_pu;
++    x_pu = x0 >> s->ps.sps->log2_min_pu_size;
++    y_pu = y0 >> s->ps.sps->log2_min_pu_size;
++    x265_MVReuse *x265_myPu = NULL;
++
++    int mv_flag = 0;
++    if (s->avctx->i_use_remv && s->ps.sps->log2_min_pu_size == 2)
++        mv_flag = op_ffmpeg_mv_flag(s->ps.sps->temporal_layer[s->ps.sps->max_sub_layers -1].max_dec_pic_buffering,
++                                    s->ps.sps->temporal_layer[s->ps.sps->max_sub_layers -1].max_latency_increase,
++                                    s->avctx->i_scale_width, s->avctx->i_scale_height, s->avctx->width, s->avctx->height,
++                                    s->avctx->i_use_remv, s->avctx->bframes, s->avctx->preset, s->avctx->tune);
++
+     if (SAMPLE_CTB(s->skip_flag, x_cb, y_cb)) {
+         hls_prediction_unit(lc, x0, y0, cb_size, cb_size, log2_cb_size, 0, idx);
+         intra_prediction_unit_default_value(lc, x0, y0, log2_cb_size);
+ 
+         if (!s->sh.disable_deblocking_filter_flag)
+             ff_hevc_deblocking_boundary_strengths(lc, x0, y0, log2_cb_size);
++
++        if (mv_flag)
++        {
++            for (int j = 0; j < cb_size >> s->ps.sps->log2_min_pu_size; j++)
++            {
++                for (int i = 0; i < cb_size >> s->ps.sps->log2_min_pu_size; i++)
++                {
++                    x265_myPu = &(s->ref->frame->myFrame->x265_myPu[x_pu + i][y_pu + j]);
++                    x265_myPu->cu_x = x0;
++                    x265_myPu->cu_y = y0;
++                    x265_myPu->cb_size = cb_size;
++                    x265_myPu->pred_mode = MODE_SKIP;
++                    x265_myPu->part_mode = PART_2Nx2N;
++                    x265_myPu->merge_flag = 1;
++                }
++            }
++        }
+     } else {
+         int pcm_flag = 0;
+ 
+@@ -2310,6 +2416,23 @@ static int hls_coding_unit(HEVCLocalContext *lc, const HEVCContext *s, int x0, i
+             } else {
+                 intra_prediction_unit(lc, x0, y0, log2_cb_size);
+             }
++            if (mv_flag)
++            {
++                for (int j = 0; j < cb_size >> s->ps.sps->log2_min_pu_size; j++)
++                {
++                    for (int i = 0; i < cb_size >> s->ps.sps->log2_min_pu_size; i++)
++                    {
++                        x265_myPu = &(s->ref->frame->myFrame->x265_myPu[x_pu + i][y_pu + j]);
++                        x265_myPu->cu_x = x0;
++                        x265_myPu->cu_y = y0;
++                        x265_myPu->cb_size = cb_size;
++                        x265_myPu->pred_mode = MODE_INTRA;
++                        x265_myPu->part_mode = lc->cu.part_mode;
++                        x265_myPu->merge_flag = 0;
++                        x265_myPu->pred_flag = 0;
++                    }
++                }
++            }
+         } else {
+             intra_prediction_unit_default_value(lc, x0, y0, log2_cb_size);
+             switch (lc->cu.part_mode) {
+@@ -2347,6 +2470,22 @@ static int hls_coding_unit(HEVCLocalContext *lc, const HEVCContext *s, int x0, i
+                 hls_prediction_unit(lc, x0 + cb_size / 2, y0 + cb_size / 2, cb_size / 2, cb_size / 2, log2_cb_size, 3, idx - 1);
+                 break;
+             }
++
++            if (mv_flag)
++            {
++                for (int j = 0; j < cb_size >> s->ps.sps->log2_min_pu_size; j++)
++                {
++                    for (int i = 0; i < cb_size >> s->ps.sps->log2_min_pu_size; i++)
++                    {
++                        x265_myPu = &(s->ref->frame->myFrame->x265_myPu[x_pu + i][y_pu + j]);
++                        x265_myPu->cu_x = x0;
++                        x265_myPu->cu_y = y0;
++                        x265_myPu->cb_size = cb_size;
++                        x265_myPu->pred_mode = MODE_INTER;
++                        x265_myPu->part_mode = lc->cu.part_mode;
++                    }
++                }
++            }
+         }
+ 
+         if (!pcm_flag) {
+@@ -2382,6 +2521,29 @@ static int hls_coding_unit(HEVCLocalContext *lc, const HEVCContext *s, int x0, i
+         x += min_cb_width;
+     }
+ 
++    if (s->avctx->i_use_remv == 1)
++    {
++        if ((cb_size >> 4) == 0)
++        {
++            if ((x0 % 16 == 0) && (y0 % 16 == 0))
++            {
++                MVReuse* myMb = &(s->ref->frame->myFrame->myMb[(x0 >> 4)][(y0 >> 4)]);
++                myMb->i_qp_aq = lc->qp_y;
++            }
++        }
++        else
++        {
++            for (int i = 0; i < cb_size >> 4; i++)
++            {
++                for (int j = 0; j < cb_size >> 4; j++)
++                {
++                    MVReuse* myMb = &(s->ref->frame->myFrame->myMb[(x0 >> 4) + i][(y0 >> 4) + j]);
++                    myMb->i_qp_aq = lc->qp_y;
++                }
++            }
++        }
++    }
++
+     if(((x0 + (1<<log2_cb_size)) & qp_block_mask) == 0 &&
+        ((y0 + (1<<log2_cb_size)) & qp_block_mask) == 0) {
+         lc->qPy_pred = lc->qp_y;
+@@ -2882,6 +3044,8 @@ static int hevc_frame_start(HEVCContext *s)
+     if (ret < 0)
+         goto fail;
+ 
++    s->frame->bref = s->nal_unit_type;
++
+     ret = ff_hevc_frame_rps(s);
+     if (ret < 0) {
+         av_log(s->avctx, AV_LOG_ERROR, "Error constructing the frame RPS.\n");
+@@ -3354,6 +3518,7 @@ static int hevc_decode_frame(AVCodecContext *avctx, AVFrame *rframe,
+     uint8_t *sd;
+     size_t sd_size;
+     HEVCContext *s = avctx->priv_data;
++    AVFrame *pict;
+ 
+     if (!avpkt->size) {
+         ret = ff_hevc_output_frame(s, rframe, 1);
+@@ -3361,6 +3526,44 @@ static int hevc_decode_frame(AVCodecContext *avctx, AVFrame *rframe,
+             return ret;
+ 
+         *got_output = ret;
++
++        if ((s->avctx->i_use_remv || s->avctx->i_jnd_decqp)&&(*got_output)) {
++
++            pict = rframe;
++
++            HEVCSPS *sps                           = (HEVCSPS*)s->ps.sps;
++            HEVCPPS *pps                           = (HEVCPPS*)s->ps.pps;
++            HEVCVPS *vps                           = (HEVCVPS*)s->ps.vps;
++            pict->myFrame->i_frame              = s->avctx->i_input_number - s->avctx->has_b_frames;
++            pict->myFrame->num_reorder_frames   = (s->avctx->has_b_frames>0)?1:0;//sps->temporal_layer[0].num_reorder_pics;
++            pict->myFrame->ref_max              = log2(sps->log2_max_poc_lsb);
++            pict->myFrame->ref_max_h265         = sps->temporal_layer[sps->max_sub_layers - 1].max_dec_pic_buffering - 1;
++            if (2 != s->ps.sps->log2_min_pu_size) {pict->myFrame->ref_max_h265 = -1;}
++            uint32_t fpsNum, fpsDenom;
++            if (s->avctx->framerate.num > 0 && s->avctx->framerate.den > 0) {
++                fpsNum      = s->avctx->framerate.num;
++                fpsDenom    = s->avctx->framerate.den;
++                if (fpsNum > 0 && fpsDenom > 0) { pict->myFrame->framerate = fpsNum / fpsDenom; }
++            } else {
++                fpsNum      = s->avctx->time_base.den;
++                fpsDenom    = s->avctx->time_base.num * s->avctx->ticks_per_frame;
++                if (fpsNum > 0 && fpsDenom > 0) { pict->myFrame->framerate = fpsNum / fpsDenom; }
++            }
++            pict->myFrame->ref_count[0]         = pps->num_ref_idx_l0_default_active;
++            pict->myFrame->ref_count[1]         = pps->num_ref_idx_l1_default_active;
++            pict->myFrame->weighted_pred        = pps->weighted_pred_flag;
++            pict->myFrame->weighted_bipred_flag = pps->weighted_bipred_flag;
++            if(pict->pict_type == 1)
++                pict->myFrame->i_frame_type    = (pict->bref==HEVC_NAL_IDR_N_LP)?1:5;
++            else if(pict->pict_type == 3)
++                pict->myFrame->i_frame_type    = (pict->bref==HEVC_NAL_TRAIL_R||pict->bref==HEVC_NAL_RASL_R)?4:3;
++            else
++                pict->myFrame->i_frame_type    = pict->pict_type;
++            pict->myFrame->in_width            = s->avctx->width;
++            pict->myFrame->in_height           = s->avctx->height;
++            pict->myFrame->is_dup_frame        = 0;
++            pict->myFrame->in_depth            = av_pix_fmt_desc_get(s->avctx->pix_fmt)->comp[0].depth;
++        }
+         return 0;
+     }
+ 
+@@ -3414,6 +3617,42 @@ static int hevc_decode_frame(AVCodecContext *avctx, AVFrame *rframe,
+ 
+     if (s->output_frame->buf[0]) {
+         av_frame_move_ref(rframe, s->output_frame);
++        if (s->avctx->i_use_remv || s->avctx->i_jnd_decqp) {
++
++            pict = rframe;
++
++            HEVCSPS *sps                           = (HEVCSPS*)s->ps.sps;
++            HEVCPPS *pps                           = (HEVCPPS*)s->ps.pps;
++            HEVCVPS *vps                           = (HEVCVPS*)s->ps.vps;
++            pict->myFrame->i_frame              = s->avctx->i_input_number - s->avctx->has_b_frames;
++            pict->myFrame->num_reorder_frames   = (s->avctx->has_b_frames>0)?1:0;//sps->temporal_layer[0].num_reorder_pics;
++            pict->myFrame->ref_max              = log2(sps->log2_max_poc_lsb);
++            pict->myFrame->ref_max_h265         = sps->temporal_layer[sps->max_sub_layers - 1].max_dec_pic_buffering - 1;
++            if (2 != s->ps.sps->log2_min_pu_size) {pict->myFrame->ref_max_h265 = -1;}
++            uint32_t fpsNum, fpsDenom;
++            if (s->avctx->framerate.num > 0 && s->avctx->framerate.den > 0) {
++                fpsNum      = s->avctx->framerate.num;
++                fpsDenom    = s->avctx->framerate.den;
++                if (fpsNum > 0 && fpsDenom > 0) { pict->myFrame->framerate = fpsNum / fpsDenom; }
++            } else {
++                fpsNum      = s->avctx->time_base.den;
++                fpsDenom    = s->avctx->time_base.num * s->avctx->ticks_per_frame;
++                if (fpsNum > 0 && fpsDenom > 0) { pict->myFrame->framerate = fpsNum / fpsDenom; }
++            }
++            pict->myFrame->ref_count[1]         = pps->num_ref_idx_l1_default_active;
++            pict->myFrame->weighted_pred        = pps->weighted_pred_flag;
++            pict->myFrame->weighted_bipred_flag = pps->weighted_bipred_flag;
++            if(pict->pict_type == 1)
++                pict->myFrame->i_frame_type    = (pict->bref==HEVC_NAL_IDR_N_LP)?1:5;
++            else if(pict->pict_type == 3)
++                pict->myFrame->i_frame_type    = (pict->bref==HEVC_NAL_TRAIL_R||pict->bref==HEVC_NAL_RASL_R)?4:3;
++            else
++                pict->myFrame->i_frame_type    = pict->pict_type;
++            pict->myFrame->in_width            = s->avctx->width;
++            pict->myFrame->in_height           = s->avctx->height;
++            pict->myFrame->is_dup_frame        = 0;
++            pict->myFrame->in_depth            = av_pix_fmt_desc_get(s->avctx->pix_fmt)->comp[0].depth;
++        }
+         *got_output = 1;
+     }
+ 
+diff --git a/libavcodec/internal.h b/libavcodec/internal.h
+index 64fe0122c8..6ab8887ad0 100644
+--- a/libavcodec/internal.h
++++ b/libavcodec/internal.h
+@@ -79,6 +79,7 @@ typedef struct AVCodecInternal {
+      * for decoding.
+      */
+     AVPacket *last_pkt_props;
++    struct AVFifo *pkt_props;
+ 
+     /**
+      * temporary buffer used for encoders to store their bitstream
+diff --git a/libavcodec/libx264.c b/libavcodec/libx264.c
+index 813ccbbdb3..a4b14a7a73 100644
+--- a/libavcodec/libx264.c
++++ b/libavcodec/libx264.c
+@@ -501,6 +501,7 @@ static int setup_frame(AVCodecContext *ctx, const AVFrame *frame,
+     }
+ 
+     pic->i_pts  = frame->pts;
++    pic->myFrame = frame->myFrame;
+ 
+     opaque_uninit(opaque);
+ 
+@@ -1428,6 +1429,19 @@ FF_ENABLE_DEPRECATION_WARNINGS
+ 
+     avctx->bit_rate = x4->params.rc.i_bitrate*1000LL;
+ 
++    if( avctx->i_use_remv && detect_mvreuse() )
++    {
++        if( avctx->myFrame != NULL )
++            x264_param_default_preset_mvreuse(&x4->params, avctx->i_use_remv, avctx->i_jnd_decqp,
++                avctx->myFrame->framerate, avctx->myFrame->num_reorder_frames, avctx->i_use_remv_fref, avctx->myFrame->ref_max, avctx->myFrame->weighted_pred, avctx->gop_size, X264_KEYINT_MAX_INFINITE, avctx->myFrame->in_width, avctx->myFrame->in_height, avctx->myFrame->in_depth);
++
++        if( avctx->myFrame == NULL && avctx->i_use_remv == 4 )
++            x264_param_default_preset_mvreuse4(&x4->params, avctx->i_jnd_decqp, avctx->myFrame->in_depth);
++
++    }
++    else
++        x4->params.i_use_remv = 0;
++
+     x4->enc = x264_encoder_open(&x4->params);
+     if (!x4->enc)
+         return AVERROR_EXTERNAL;
+diff --git a/libavcodec/libx265.c b/libavcodec/libx265.c
+index c1202fa924..45358fc767 100644
+--- a/libavcodec/libx265.c
++++ b/libavcodec/libx265.c
+@@ -528,6 +528,28 @@ FF_ENABLE_DEPRECATION_WARNINGS
+         }
+     }
+ 
++    if(avctx->i_use_remv)
++    {
++        if( avctx->myFrame != NULL )
++        {
++            if (ctx->preset)
++            {
++                x265_param_default_preset_mvreuse(ctx->params, ctx->preset, avctx->i_use_remv, avctx->myFrame->num_reorder_frames, avctx->myFrame->ref_max_h265,
++                avctx->myFrame->weighted_pred, avctx->myFrame->weighted_bipred_flag, avctx->myFrame->in_width, avctx->myFrame->in_height, avctx->myFrame->in_depth, avctx->myFrame->framerate);
++            }
++            else
++            {
++                x265_param_default_preset_mvreuse(ctx->params, "medium", avctx->i_use_remv, avctx->myFrame->num_reorder_frames, avctx->myFrame->ref_max_h265,
++                avctx->myFrame->weighted_pred, avctx->myFrame->weighted_bipred_flag, avctx->myFrame->in_width, avctx->myFrame->in_height, avctx->myFrame->in_depth, avctx->myFrame->framerate);
++            }
++        }
++
++        if( avctx->myFrame == NULL && avctx->i_use_remv == 4 )
++            x265_param_default_preset_mvreuse4(ctx->params, avctx->myFrame->in_depth);
++    }
++    else
++        ctx->params->i_use_remv = 0;
++
+     ctx->encoder = ctx->api->encoder_open(ctx->params);
+     if (!ctx->encoder) {
+         av_log(avctx, AV_LOG_ERROR, "Cannot open libx265 encoder.\n");
+@@ -677,6 +699,7 @@ static int libx265_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
+         }
+ 
+         x265pic.pts      = pic->pts;
++        x265pic.myFrame  = pic->myFrame;
+         x265pic.bitDepth = av_pix_fmt_desc_get(avctx->pix_fmt)->comp[0].depth;
+ 
+         x265pic.sliceType = pic->pict_type == AV_PICTURE_TYPE_I ?
+diff --git a/libavcodec/mpegutils.c b/libavcodec/mpegutils.c
+index d94e8f422f..c7ba60f93c 100644
+--- a/libavcodec/mpegutils.c
++++ b/libavcodec/mpegutils.c
+@@ -28,6 +28,8 @@
+ #include "libavutil/motion_vector.h"
+ #include "libavutil/avassert.h"
+ 
++#include "h264_ps.h"
++#include "h264dec.h"
+ #include "avcodec.h"
+ #include "mpegutils.h"
+ 
+diff --git a/libavcodec/options_table.h b/libavcodec/options_table.h
+index 7a2ef3474e..5a3d1154f6 100644
+--- a/libavcodec/options_table.h
++++ b/libavcodec/options_table.h
+@@ -407,6 +407,14 @@ static const AVOption avcodec_options[] = {
+     {"mastering_display_metadata",  .default_val.i64 = AV_PKT_DATA_MASTERING_DISPLAY_METADATA,  .type = AV_OPT_TYPE_CONST, .flags = A|D, .unit = "side_data_pkt" },
+     {"content_light_level",         .default_val.i64 = AV_PKT_DATA_CONTENT_LIGHT_LEVEL,         .type = AV_OPT_TYPE_CONST, .flags = A|D, .unit = "side_data_pkt" },
+     {"icc_profile",                 .default_val.i64 = AV_PKT_DATA_ICC_PROFILE,                 .type = AV_OPT_TYPE_CONST, .flags = A|D, .unit = "side_data_pkt" },
++{"mvreuse", "MVReuse strategy (0:close 1:gain 2:fast 3:balance 4:custom)", OFFSET(i_use_remv), AV_OPT_TYPE_INT, {.i64 = 0 }, 0, 4, V|D|E},
++{"mvreuse-fref", "Force ref num while MVReuse", OFFSET(i_use_remv_fref), AV_OPT_TYPE_INT, {.i64 = 0 }, 0, 16, V|D|E},
++{"jnd-decqp", "Adaptive CDEF by decode qp", OFFSET(i_jnd_decqp), AV_OPT_TYPE_INT, {.i64 = 0 }, 0, 1, V|D|E},
++{"scale_width", "scale width", OFFSET(i_scale_width), AV_OPT_TYPE_INT, {.i64 = 0 }, 0, INT_MAX, V|D|E},
++{"scale_height", "scale height", OFFSET(i_scale_height), AV_OPT_TYPE_INT, {.i64 = 0 }, 0, INT_MAX, V|D|E},
++{"preset", "input preset", OFFSET(preset), AV_OPT_TYPE_STRING, { .str = NULL },  0, 0, V|D|E},
++{"tune", "input tune", OFFSET(tune), AV_OPT_TYPE_STRING, { .str = NULL },  0, 0, V|D|E},
++{"bframes", "input bframes", OFFSET(bframes), AV_OPT_TYPE_INT, {.i64 = 1 }, 0, INT_MAX, V|D|E},
+ {NULL},
+ };
+ 
+diff --git a/libavcodec/pthread_frame.c b/libavcodec/pthread_frame.c
+index fd356bd190..f64c325ad3 100644
+--- a/libavcodec/pthread_frame.c
++++ b/libavcodec/pthread_frame.c
+@@ -413,6 +413,10 @@ static int update_context_from_user(AVCodecContext *dst, const AVCodecContext *s
+ 
+     dst->frame_num        = src->frame_num;
+ 
++    int *i_input_number_unconst = &(src->i_input_number);
++
++    dst->i_input_number   = (*i_input_number_unconst)++;
++
+     av_packet_unref(dst->internal->last_pkt_props);
+     err = av_packet_copy_props(dst->internal->last_pkt_props, src->internal->last_pkt_props);
+     if (err < 0)
+diff --git a/libavfilter/dnn/dnn_backend_openvino.c b/libavfilter/dnn/dnn_backend_openvino.c
+index 375643377f..ed490009b0 100644
+--- a/libavfilter/dnn/dnn_backend_openvino.c
++++ b/libavfilter/dnn/dnn_backend_openvino.c
+@@ -48,6 +48,9 @@ typedef struct OVOptions{
+     DNNLayout layout;
+     float scale;
+     float mean;
++    char *threads;
++    char *nstreams;
++    char *pinning;
+ } OVOptions;
+ 
+ typedef struct OVContext {
+@@ -101,6 +104,9 @@ typedef struct OVRequestItem {
+ #define FLAGS AV_OPT_FLAG_FILTERING_PARAM
+ static const AVOption dnn_openvino_options[] = {
+     { "device", "device to run model", OFFSET(options.device_type), AV_OPT_TYPE_STRING, { .str = "CPU" }, 0, 0, FLAGS },
++    { "threads", "num of threads", OFFSET(options.threads), AV_OPT_TYPE_STRING, { .str = "UNSPECIFIED" }, 0, 0, FLAGS },
++    { "nstreams", "num of nstreams", OFFSET(options.nstreams), AV_OPT_TYPE_STRING, { .str = "UNSPECIFIED" }, 0, 0, FLAGS },
++    { "pinning", "whether pinning", OFFSET(options.pinning), AV_OPT_TYPE_STRING, { .str = "UNSPECIFIED" }, 0, 0, FLAGS },
+     DNN_BACKEND_COMMON_OPTIONS
+     { "batch_size",  "batch size per request", OFFSET(options.batch_size),  AV_OPT_TYPE_INT,    { .i64 = 1 },     1, 1000, FLAGS},
+     { "input_resizable", "can input be resizable or not", OFFSET(options.input_resizable), AV_OPT_TYPE_BOOL,   { .i64 = 0 },     0, 1, FLAGS },
+@@ -1427,6 +1433,17 @@ static DNNModel *dnn_load_model_ov(const char *model_filename, DNNFunctionType f
+     if (status != OK) {
+         goto err;
+     }
++
++    if (!strcmp(ctx->options.device_type, "CPU") && strcmp(ctx->options.threads, "UNSPECIFIED")) {
++        ov_core_set_property(core, ctx->options.device_type, "INFERENCE_NUM_THREADS", ctx->options.threads);
++    }
++    if (!strcmp(ctx->options.device_type, "CPU") && strcmp(ctx->options.nstreams, "UNSPECIFIED")) {
++        ov_core_set_property(core, ctx->options.device_type, "NUM_STREAMS", ctx->options.nstreams);
++    }
++    if (!strcmp(ctx->options.device_type, "CPU") && strcmp(ctx->options.pinning, "UNSPECIFIED")) {
++        ov_core_set_property(core, ctx->options.device_type, "ENABLE_CPU_PINNING", ctx->options.pinning);
++    }
++
+     ov_model->core = core;
+ 
+     status = ov_core_read_model(core, model_filename, NULL, &ovmodel);
+diff --git a/libavutil/frame.c b/libavutil/frame.c
+index 67fbf89f19..53e27e2fde 100644
+--- a/libavutil/frame.c
++++ b/libavutil/frame.c
+@@ -317,6 +317,8 @@ FF_ENABLE_DEPRECATION_WARNINGS
+     dst->colorspace             = src->colorspace;
+     dst->color_range            = src->color_range;
+     dst->chroma_location        = src->chroma_location;
++    dst->bref                   = src->bref;
++    dst->myFrame                = src->myFrame;
+ 
+     av_dict_copy(&dst->metadata, src->metadata, 0);
+ 
+diff --git a/libavutil/frame.h b/libavutil/frame.h
+index 8aa05ec127..00c4f33922 100644
+--- a/libavutil/frame.h
++++ b/libavutil/frame.h
+@@ -240,6 +240,74 @@ enum AVActiveFormatDescription {
+     AV_AFD_SP_4_3       = 15,
+ };
+ 
++/**
++ * MV Reuse.
++ */
++#ifndef _MV_REUSE_
++#define _MV_REUSE_
++
++struct MyInfo {
++    int frame_num;
++    // AVMotionVector *sd;
++    uint32_t *mb_type;
++    int mb_num;
++    int size;
++    uint8_t *data;
++    int my_slice_type;
++    int ref_fra;
++    int ref_flag;
++};
++
++typedef struct MVReuseAVMotionVector {
++    short mv[2][2];
++    int i_ref[2];
++} MVReuseAVMotionVector;
++
++typedef struct MVReuse {
++    int i_type;
++    int i_part;
++    int i_skip_qp_get_flag;
++    int i_qp_aq;
++    MVReuseAVMotionVector sub_mb[4];
++} MVReuse;
++
++typedef struct x265_MVReuse {
++    int cu_x;
++    int cu_y;
++    int cb_size;
++    int pred_mode;
++    int part_mode;
++    int merge_flag;
++    int pred_flag;
++    int ref_idx[2];
++    int ref_poc[2];
++    int16_t mv[2][2];
++} x265_MVReuse;
++
++typedef struct FrameReuse {
++    int i_frame;
++    int i_frame_type;
++    int weighted_pred;
++    int weighted_bipred_flag;
++    int ref_max;
++    int ref_max_h265;
++    int ref_count[2];
++    int num_reorder_frames;
++    int i_h264_frame_type;
++    int in_width;
++    int in_height;
++    int is_dup_frame;
++    int in_depth;
++    int framerate;
++    float i_frame_avg_qp_aq;
++    int output_stream_count;
++    int output_stream_drop_count;
++    int output_stream_num;
++    MVReuse myMb[300][300];
++    MVReuse myMb_resize[300][300];
++    x265_MVReuse x265_myPu[1200][1200];
++} FrameReuse;
++#endif
+ 
+ /**
+  * Structure to hold side data for an AVFrame.
+@@ -748,6 +816,14 @@ typedef struct AVFrame {
+      * Duration of the frame, in the same units as pts. 0 if unknown.
+      */
+     int64_t duration;
++    /**
++     * b_reference_frame flag
++     */
++    int bref;
++    /**
++     * MVReuse structure
++     */
++    FrameReuse *myFrame;
+ } AVFrame;
+ 
+ 
+-- 
+2.43.0
+
